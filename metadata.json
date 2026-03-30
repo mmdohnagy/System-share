@@ -1,0 +1,5 @@
+{
+  "name": "Swish Menu",
+  "description": "A professional multi-brand menu and product management system with advanced RBAC and dynamic form builder.",
+  "requestFramePermissions": ["microphone"]
+}
