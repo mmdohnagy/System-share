@@ -3482,12 +3482,33 @@ async function startServer() {
       console.error("Vite middleware failed:", e);
     }
   } else if (distExists) {
+    console.log("--- DIST FOLDER STRUCTURE ---");
+    const walk = (dir: string) => {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        const p = path.join(dir, file);
+        if (fs.statSync(p).isDirectory()) {
+          walk(p);
+        } else {
+          console.log("Found File:", p.replace(distPath, ""));
+        }
+      }
+    };
+    try { walk(distPath); } catch(e) { console.error("Error walking dist:", e); }
+    console.log("-----------------------------");
+
     console.log("Production mode: Serving from dist folder");
     app.use(express.static(distPath));
     
     app.get("*", (req, res, next) => {
       if (req.url.startsWith("/api")) return next();
       
+      // Fix: If it's a request for a file (has a dot) and reached here, it's a 404, NOT index.html
+      if (req.path.includes(".") || req.url.includes(".")) {
+        console.log("Asset not found (404):", req.url);
+        return res.status(404).send("File not found");
+      }
+
       const filePath = path.join(distPath, "index.html");
       if (fs.existsSync(filePath)) {
         res.sendFile(filePath);
