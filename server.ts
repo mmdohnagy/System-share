@@ -3503,9 +3503,19 @@ async function startServer() {
     app.get("*", (req, res, next) => {
       if (req.url.startsWith("/api")) return next();
       
-      // Fix: If it's a request for a file (has a dot) and reached here, it's a 404, NOT index.html
+      // Detailed logging for 404 assets
       if (req.path.includes(".") || req.url.includes(".")) {
-        console.log("Asset not found (404):", req.url);
+        const fullPath = path.join(distPath, req.path);
+        console.log(`Asset 404: ${req.url} (Checked path: ${fullPath})`);
+        
+        // Check if the directory exists and what's inside
+        const dirPath = path.dirname(fullPath);
+        if (fs.existsSync(dirPath)) {
+          console.log(`Directory ${dirPath} contents:`, fs.readdirSync(dirPath));
+        } else {
+          console.log(`Directory ${dirPath} does NOT exist.`);
+        }
+        
         return res.status(404).send("File not found");
       }
 
