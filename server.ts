@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { createServer as createViteServer } from "vite";
@@ -5,13 +6,16 @@ import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import path from "path";
 import { fileURLToPath } from "url";
-import { Pool } from "pg";
+import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import * as XLSX from "xlsx";
 import * as fs from "fs";
 
+const { Pool } = pg;
+
 console.log("SERVER.TS STARTING INITIALIZATION...");
+console.log("DATABASE_URL check:", process.env.DATABASE_URL ? "SET" : "NOT SET");
 console.log("Current directory:", process.cwd());
 
 process.on('uncaughtException', (err) => {
@@ -3465,20 +3469,18 @@ async function startServer() {
 
   if (distExists) {
     console.log("Production mode: Serving static files from", distPath);
-    app.use(express.static(distPath));
+    
+    // Serve static files first
+    app.use(express.static(distPath, {
+      index: false,
+      maxAge: '1d'
+    }));
     
     // SPA fallback: Serve index.html for any non-API route
     app.get("*", (req, res, next) => {
       // Don't intercept API calls
       if (req.url.startsWith("/api")) return next();
       
-      // If it's a request for a file (has a dot in the last part), and we're here, it means express.static missed it
-      const isFileRequest = req.url.split("/").pop()?.includes(".");
-      if (isFileRequest) {
-        console.log(`Static file not found: ${req.url}`);
-        return res.status(404).send("Not found");
-      }
-
       res.sendFile(path.join(distPath, "index.html"), (err) => {
         if (err) {
           console.error("Error sending index.html:", err);
