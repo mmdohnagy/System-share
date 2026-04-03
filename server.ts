@@ -3457,17 +3457,36 @@ async function startServer() {
   });
 
   // Serve static files
-  const isProduction = process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT_NAME !== undefined;
-  const distPath = path.join(process.cwd(), "dist");
+  const distPath = path.resolve(__dirname, "dist");
+  const distExists = fs.existsSync(distPath);
   
-  if (fs.existsSync(distPath)) {
+  console.log("Checking for static files at:", distPath);
+  console.log("Static files directory exists:", distExists);
+
+  if (distExists) {
     console.log("Production mode: Serving static files from", distPath);
     app.use(express.static(distPath));
+    
+    // SPA fallback: Serve index.html for any non-API route
     app.get("*", (req, res, next) => {
+      // Don't intercept API calls
       if (req.url.startsWith("/api")) return next();
-      res.sendFile(path.join(distPath, "index.html"));
+      
+      // If it's a request for a file (has a dot in the last part), and we're here, it means express.static missed it
+      const isFileRequest = req.url.split("/").pop()?.includes(".");
+      if (isFileRequest) {
+        console.log(`Static file not found: ${req.url}`);
+        return res.status(404).send("Not found");
+      }
+
+      res.sendFile(path.join(distPath, "index.html"), (err) => {
+        if (err) {
+          console.error("Error sending index.html:", err);
+          res.status(500).send("Error loading page");
+        }
+      });
     });
-  } else {
+  } else if (process.env.NODE_ENV !== "production") {
     console.log("Development mode: Starting Vite middleware...");
     try {
       const vite = await createViteServer({
@@ -3478,6 +3497,18 @@ async function startServer() {
     } catch (e) {
       console.error("Vite middleware failed:", e);
     }
+  } else {
+    console.error("CRITICAL ERROR: 'dist' folder not found in production environment!");
+    console.log("Current working directory:", process.cwd());
+    console.log("Files in current directory:", fs.readdirSync(process.cwd()));
+    
+    app.get("*", (req, res) => {
+      res.status(500).send(`
+        <h1>Frontend Build Missing</h1>
+        <p>The 'dist' folder was not found. Please ensure 'npm run build' was executed during deployment.</p>
+        <p>Current Path: ${distPath}</p>
+      `);
+    });
   }
 
   // Global Error Handler
