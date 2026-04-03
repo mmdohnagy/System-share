@@ -3461,7 +3461,15 @@ async function startServer() {
   const distPath = path.join(process.cwd(), "dist");
   const distExists = fs.existsSync(distPath);
 
-  if (!isProduction || !distExists) {
+  if (isProduction && distExists) {
+    console.log("Serving static files from dist:", distPath);
+    app.use(express.static(distPath));
+    app.get("*", (req, res, next) => {
+      // Avoid intercepting API routes
+      if (req.url.startsWith('/api')) return next();
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  } else {
     console.log("Using Vite middleware... (Starting createViteServer)");
     try {
       const vite = await createViteServer({
@@ -3473,12 +3481,6 @@ async function startServer() {
     } catch (viteErr) {
       console.error("Failed to create Vite server:", viteErr);
     }
-  } else {
-    console.log("Serving static files from dist:", distPath);
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
   }
 
   // Global Error Handler
