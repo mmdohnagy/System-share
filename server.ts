@@ -5,11 +5,10 @@ import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import path from "path";
 import { fileURLToPath } from "url";
-import Database from 'better-sqlite3';
+import { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import * as XLSX from "xlsx";
-
 import * as fs from "fs";
 
 console.log("SERVER.TS STARTING INITIALIZATION...");
@@ -26,55 +25,59 @@ process.on('unhandledRejection', (reason, promise) => {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const sqliteDb = new Database('database.sqlite');
-sqliteDb.pragma('foreign_keys = ON');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-key";
 
-// Helper for SQLite queries (synchronous to match better-sqlite3)
-function dbQuery(sql: string, params: any[] = []) {
-  return sqliteDb.prepare(sql).run(...params);
-}
-
-function dbGet(sql: string, params: any[] = []) {
-  return sqliteDb.prepare(sql).get(...params);
-}
-
-function dbAll(sql: string, params: any[] = []) {
-  return sqliteDb.prepare(sql).all(...params);
-}
-
-function dbRun(sql: string, params: any[] = []) {
-  const info = sqliteDb.prepare(sql).run(...params);
-  return { lastInsertRowid: info.lastInsertRowid, changes: info.changes };
-}
-
-// Compatibility wrapper for existing db.prepare calls
+// Compatibility wrapper for PostgreSQL (Async)
 const db = {
-  prepare: (sql: string) => ({
-    all: (...params: any[]) => sqliteDb.prepare(sql).all(...params),
-    get: (...params: any[]) => sqliteDb.prepare(sql).get(...params),
-    run: (...params: any[]) => sqliteDb.prepare(sql).run(...params),
-  }),
-  exec: (sql: string) => sqliteDb.exec(sql),
-  transaction: (fn: any) => sqliteDb.transaction(fn),
+  query: (text: string, params?: any[]) => pool.query(text, params),
+  exec: (sql: string) => pool.query(sql),
+  get: async (text: string, params?: any[]) => {
+    const res = await pool.query(text, params);
+    return res.rows[0];
+  },
+  all: async (text: string, params?: any[]) => {
+    const res = await pool.query(text, params);
+    return res.rows;
+  },
+  // Transaction helper
+  transaction: async (fn: (client: any) => Promise<any>) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await fn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
 };
 
-const getBrandRestriction = (user: any) => {
+const getBrandRestriction = async (user: any) => {
   // Check junction table for multiple brands (for Marketing Team, Call Center or Restaurants)
-  const userBrands = dbAll(`
+  const userBrandsResult = await db.query(`
     SELECT b.name 
     FROM user_brands ub 
     JOIN brands b ON ub.brand_id = b.id 
-    WHERE ub.user_id = ?
-  `, [user.id]) as { name: string }[];
+    WHERE ub.user_id = $1
+  `, [user.id]);
+  const userBrands = userBrandsResult.rows;
 
   if (userBrands.length > 0) {
     return { type: 'include', brands: userBrands.map(b => b.name) };
   }
 
   if (user.brand_id) {
-    const brand = dbGet("SELECT name FROM brands WHERE id = ?", [user.brand_id]) as { name: string };
+    const brandResult = await db.query("SELECT name FROM brands WHERE id = $1", [user.brand_id]);
+    const brand = brandResult.rows[0];
     if (brand) {
       return { type: 'include', brands: [brand.name] };
     }
@@ -86,35 +89,156 @@ function getCurrentKuwaitTime() {
   return new Date().toISOString();
 }
 
+// Audit Log Function
+async function logAction(userId: number, action: string, targetTable: string, targetId: number | null, oldValue: any, newValue: any) {
+  try {
+    await db.query(
+      "INSERT INTO audit_logs (user_id, action, target_table, target_id, old_value, new_value) VALUES ($1, $2, $3, $4, $5, $6)",
+      [
+        userId,
+        action,
+        targetTable,
+        targetId,
+        oldValue ? JSON.stringify(oldValue) : null,
+        newValue ? JSON.stringify(newValue) : null,
+      ]
+    );
+  } catch (error) {
+    console.error("Failed to log action:", error);
+  }
+}
+
+// Seed Data Function
+async function seedData() {
+  const roles = [
+    "Technical Back Office",
+    "Manager",
+    "Super Visor",
+    "Restaurants",
+    "Call Center",
+    "Marketing Team",
+    "Coding Team"
+  ];
+
+  for (const role of roles) {
+    await db.query("INSERT INTO roles (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [role]);
+  }
+
+  // Create default admin if no users exist
+  const userCount = await db.get("SELECT COUNT(*) FROM users");
+  let adminUserId = 0;
+  if (Number(userCount.count) === 0) {
+    const adminRole = await db.get("SELECT id FROM roles WHERE name = $1", ["Technical Back Office"]);
+    const passwordHash = await bcrypt.hash("admin123", 10);
+    const result = await db.query(
+      "INSERT INTO users (username, password_hash, role_id) VALUES ($1, $2, $3) RETURNING id",
+      ["admin", passwordHash, adminRole.id]
+    );
+    adminUserId = result.rows[0].id;
+    console.log("Default admin user created: admin / admin123");
+  } else {
+    const admin = await db.get("SELECT id FROM users WHERE username = $1", ["admin"]);
+    adminUserId = admin.id;
+  }
+
+  // Ensure Brand BBT exists
+  await db.query("INSERT INTO brands (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", ["BBT"]);
+  const bbtBrand = await db.get("SELECT id FROM brands WHERE name = $1", ["BBT"]);
+
+  // Ensure essential dynamic fields exist
+  const fields = [
+    { name_en: "Product Name (EN)", name_ar: "اسم المنتج (انجليزي)", type: "text", order: 1 },
+    { name_en: "Category Name (EN)", name_ar: "اسم الفئة (انجليزي)", type: "text", order: 2 }
+  ];
+
+  for (const f of fields) {
+    await db.query(
+      "INSERT INTO dynamic_fields (name_en, name_ar, type, field_order) VALUES ($1, $2, $3, $4) ON CONFLICT (name_en) DO NOTHING",
+      [f.name_en, f.name_ar, f.type, f.order]
+    );
+  }
+
+  const nameField = await db.get("SELECT id FROM dynamic_fields WHERE name_en = $1", ["Product Name (EN)"]);
+
+  // Check if products already exist for BBT to avoid duplicates
+  const bbtProductCount = await db.get("SELECT COUNT(*) FROM products WHERE brand_id = $1", [bbtBrand.id]);
+  
+  if (Number(bbtProductCount.count) === 0) {
+    const productsList = [
+      "7up", "Aquafina Water", "3.5KD Deal", "BBQ Sauce", "BBT Mayo", "BBT Ranch Sauce", "BBT Sauce", 
+      "Buttercup", "Cheese Dip", "CLASSIC ROLLS BEEF", "CLASSIC ROLLS BEEF Meal", "Cheeseburger Duo Combo", 
+      "Chicken Fillaaa", "Chicken Fillaaa Meal", "Chicken Nugget Meal", "Chicken Nuggets", "Chili Lime", 
+      "Chilli Lime Old Skool", "Chilli Lime Supreme", "Chilli Lime Old Skool Meal", "Chilli Lime Supreme Meal", 
+      "Chilli Lime Tenders Fillaaa (New)", "Classic Old Skool", "Classic Supreme", "Classic Old Skool Meal", 
+      "Classic Supreme Meal", "Coleslaw", "Crispy Fries", "Curly Fries", "Extra 1pc Tenders", "Extra 1pc Toast", 
+      "Extra Cheese", "Extra Coleslaw", "Extra Sauce", "Fillaaa Sauce", "FILAAA PARTY", "French Fries", "Fries", 
+      "Honey Mustard", "Kinza Cola", "Kinza Diet Cola", "Kinza Diet Lemon", "Kinza Lemon", "Kinza Orange", 
+      "Lipton Ice Tea - Lemon Zero", "Lipton Ice Tea - Peach Zero", "Lipton Ice Tea - Red Fruits Zero", 
+      "Lipton Ice Tea - Tropical Zero", "Little Cheeseburger", "Little Chicken Burger", "Little Chicken Burger Duo Combo", 
+      "Little Wrap Fillaaa Meal", "Little Wrap Fillaaa Duo Combo", "Little Wrap Fillaaaa", "Messy Fries", "Miranda", 
+      "Mirinda", "Mountain Dew", "Nesqiuk", "Nuggets", "Nuggets Duo Combo", "Oreo Madness", "Peanut Butter", "Pepsi", 
+      "Pepsi Zero", "Quarter Pounder Burger", "Quarter Pounder Meal", "Schnitzel x Burger", "Schnitzel X Meal", "Salt", 
+      "SMOKEY ROLLS BEEF", "SMOKEY ROLLS BEEF Meal", "Shani", "Southwest Burger", "Southwest Meal", 
+      "Salt n Vinegar Tenders Fillaaa", "\"Not So Ranch\" Sauce", "Strawberry", "Sweet Chili", "Suuuper Beef", 
+      "Suuuper Beef Combo", "Suuuper Chicken", "Suuuper Chicken Combo", "Tang", "Tenders Fillaaa", "Toast", 
+      "Triple X", "Triple X Box", "TRIPLE X Meal", "Water", "Westcoast Burger", "Westcoast Meal", "Kidkit Little chicken", 
+      "Kidkit Little Cheese Burger", "Kidkit Chicken Nuggets", "XL Fillaaa Sauce"
+    ];
+
+    console.log(`Seeding ${productsList.length} products for BBT...`);
+    for (const productName of productsList) {
+      const pResult = await db.query(
+        "INSERT INTO products (brand_id, created_by, status) VALUES ($1, $2, $3) RETURNING id",
+        [bbtBrand.id, adminUserId, 'Completed']
+      );
+      const productId = pResult.rows[0].id;
+      await db.query(
+        "INSERT INTO product_field_values (product_id, field_id, value) VALUES ($1, $2, $3)",
+        [productId, nameField.id, productName]
+      );
+    }
+    console.log("BBT Products seeded successfully.");
+  }
+}
+
 // Initialize Database Function
 async function initDb() {
-  db.exec(`
+  if (!process.env.DATABASE_URL) {
+    console.warn("WARNING: DATABASE_URL is not set. Database operations will fail.");
+    return;
+  }
+  if (process.env.DATABASE_URL.includes('postgres.railway.internal')) {
+    console.error("CRITICAL ERROR: You are using an INTERNAL Railway URL. Please update DATABASE_URL in Settings to use the PUBLIC URL (DATABASE_PUBLIC_URL).");
+    throw new Error("Internal Railway URL detected. Connection will fail from outside Railway.");
+  }
+
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS roles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT UNIQUE NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS brands (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT UNIQUE NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS branches (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       brand_id INTEGER NOT NULL,
       name TEXT NOT NULL,
       FOREIGN KEY (brand_id) REFERENCES brands(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       role_id INTEGER NOT NULL,
       brand_id INTEGER,
       branch_id INTEGER,
       is_active INTEGER DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (role_id) REFERENCES roles(id),
       FOREIGN KEY (brand_id) REFERENCES brands(id),
       FOREIGN KEY (branch_id) REFERENCES branches(id)
@@ -129,7 +253,7 @@ async function initDb() {
     );
 
     CREATE TABLE IF NOT EXISTS late_order_requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       call_center_user_id INTEGER NOT NULL,
       brand_id INTEGER NOT NULL,
       branch_id INTEGER NOT NULL,
@@ -139,15 +263,15 @@ async function initDb() {
       platform TEXT NOT NULL,
       call_center_message TEXT,
       case_type TEXT DEFAULT 'Late Order',
-      dedication_time DATETIME,
+      dedication_time TIMESTAMP,
       status TEXT DEFAULT 'Pending', -- Pending, Approved, Rejected
       restaurant_message TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      restaurant_viewed_at DATETIME,
-      manager_viewed_at DATETIME,
-      restaurant_response_at DATETIME,
-      manager_responded_at DATETIME,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      restaurant_viewed_at TIMESTAMP,
+      manager_viewed_at TIMESTAMP,
+      restaurant_response_at TIMESTAMP,
+      manager_responded_at TIMESTAMP,
       technical_type TEXT,
       FOREIGN KEY (call_center_user_id) REFERENCES users(id),
       FOREIGN KEY (brand_id) REFERENCES brands(id),
@@ -157,23 +281,23 @@ async function initDb() {
 
   // Ensure technical_type column exists in late_order_requests
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN technical_type TEXT");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN technical_type TEXT");
   } catch (e) {}
 
-  db.exec(`
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS call_center_form_fields (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name_en TEXT NOT NULL,
       name_ar TEXT NOT NULL,
       type TEXT NOT NULL, -- 'text', 'selection', 'number', 'textarea'
       is_required INTEGER DEFAULT 0,
       display_order INTEGER DEFAULT 0,
       is_active INTEGER DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS call_center_field_options (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       field_id INTEGER NOT NULL,
       value_en TEXT NOT NULL,
       value_ar TEXT NOT NULL,
@@ -191,33 +315,33 @@ async function initDb() {
     );
 
     CREATE TABLE IF NOT EXISTS technical_case_types (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name_en TEXT NOT NULL,
       name_ar TEXT NOT NULL,
       is_active INTEGER DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS call_center_platforms (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name_en TEXT NOT NULL,
       name_ar TEXT NOT NULL,
       is_active INTEGER DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS call_center_case_types (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name_en TEXT NOT NULL,
       name_ar TEXT NOT NULL,
       is_active INTEGER DEFAULT 1,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
-  db.exec(`
+  await db.exec(`
   CREATE TABLE IF NOT EXISTS dynamic_fields (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name_en TEXT NOT NULL,
     name_ar TEXT NOT NULL,
     type TEXT NOT NULL, -- text, number, dropdown, multiselect, checkbox
@@ -227,7 +351,7 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS field_options (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     field_id INTEGER NOT NULL,
     value_en TEXT NOT NULL,
     value_ar TEXT NOT NULL,
@@ -236,18 +360,18 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     brand_id INTEGER NOT NULL,
     created_by INTEGER NOT NULL,
     status TEXT DEFAULT 'Draft', -- Draft, Pending Coding, Completed
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (brand_id) REFERENCES brands(id),
     FOREIGN KEY (created_by) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS product_field_values (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     product_id INTEGER NOT NULL,
     field_id INTEGER NOT NULL,
     value TEXT, -- JSON string for complex types
@@ -256,7 +380,7 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS modifier_groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     product_id INTEGER NOT NULL,
     name_en TEXT NOT NULL,
     name_ar TEXT NOT NULL,
@@ -269,7 +393,7 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS modifier_options (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     group_id INTEGER NOT NULL,
     name_en TEXT NOT NULL,
     name_ar TEXT NOT NULL,
@@ -279,46 +403,46 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS category_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     category_name TEXT UNIQUE NOT NULL,
     code TEXT NOT NULL,
     updated_by INTEGER NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (updated_by) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS product_codes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     product_id INTEGER UNIQUE NOT NULL,
     code TEXT NOT NULL,
     updated_by INTEGER NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
     FOREIGN KEY (updated_by) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS product_channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     product_id INTEGER NOT NULL,
     channel_name TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS audit_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
     action TEXT NOT NULL,
     target_table TEXT NOT NULL,
     target_id INTEGER,
     old_value TEXT,
     new_value TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS busy_period_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
     date TEXT NOT NULL,
     brand TEXT NOT NULL,
@@ -331,22 +455,22 @@ async function initDb() {
     responsible_party TEXT NOT NULL,
     comment TEXT,
     internal_notes TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS busy_branch_reasons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT UNIQUE NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS busy_branch_responsible (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     name TEXT UNIQUE NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS hidden_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
     brand_id INTEGER NOT NULL,
     branch_id INTEGER, -- NULL means All Branches
@@ -355,9 +479,9 @@ async function initDb() {
     reason TEXT NOT NULL,
     action_to_unhide TEXT,
     comment TEXT,
-    requested_at DATETIME,
+    requested_at TIMESTAMP,
     responsible_party TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (brand_id) REFERENCES brands(id),
     FOREIGN KEY (branch_id) REFERENCES branches(id),
@@ -365,7 +489,7 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS hide_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
     brand_id INTEGER NOT NULL,
     branch_id INTEGER, -- NULL means All Branches
@@ -375,9 +499,9 @@ async function initDb() {
     reason TEXT,
     action_to_unhide TEXT,
     comment TEXT,
-    requested_at DATETIME,
+    requested_at TIMESTAMP,
     responsible_party TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (brand_id) REFERENCES brands(id),
     FOREIGN KEY (branch_id) REFERENCES branches(id),
@@ -385,13 +509,13 @@ async function initDb() {
   );
 
   CREATE TABLE IF NOT EXISTS pending_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
     type TEXT NOT NULL, -- 'hide_unhide', 'busy_branch'
     data TEXT NOT NULL, -- JSON string
     status TEXT DEFAULT 'Pending', -- 'Pending', 'Approved', 'Rejected'
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     processed_by INTEGER,
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (processed_by) REFERENCES users(id)
@@ -414,7 +538,7 @@ async function initDb() {
 
 // Migration: Add is_offline to products if it doesn't exist
 try {
-  db.prepare("ALTER TABLE products ADD COLUMN is_offline INTEGER DEFAULT 0").run();
+  await db.exec("ALTER TABLE products ADD COLUMN is_offline INTEGER DEFAULT 0");
   console.log("Added is_offline column to products");
 } catch (e) {
   // Column already exists
@@ -422,7 +546,7 @@ try {
 
   // Migration: Add total_duration_minutes to busy_period_records if it doesn't exist
   try {
-    db.prepare("ALTER TABLE busy_period_records ADD COLUMN total_duration_minutes INTEGER DEFAULT 0").run();
+    await db.exec("ALTER TABLE busy_period_records ADD COLUMN total_duration_minutes INTEGER DEFAULT 0");
     console.log("Added total_duration_minutes column to busy_period_records");
   } catch (e) {
     // Column already exists
@@ -434,229 +558,249 @@ try {
     { name: 'reason', type: 'TEXT' },
     { name: 'action_to_unhide', type: 'TEXT' },
     { name: 'comment', type: 'TEXT' },
-    { name: 'requested_at', type: 'DATETIME' },
+    { name: 'requested_at', type: 'TIMESTAMP' },
     { name: 'responsible_party', type: 'TEXT' }
   ];
 
-  hideHistoryColumns.forEach(col => {
+  for (const col of hideHistoryColumns) {
     try {
-      db.prepare(`ALTER TABLE hide_history ADD COLUMN ${col.name} ${col.type}`).run();
+      await db.exec(`ALTER TABLE hide_history ADD COLUMN ${col.name} ${col.type}`);
       console.log(`Added ${col.name} column to hide_history`);
     } catch (e) {
       // Column already exists or other error
     }
-  });
+  }
 
   // Migration: Add updated_at and updated_by to hidden_items
   try {
-    db.prepare("ALTER TABLE hidden_items ADD COLUMN updated_at DATETIME").run();
-    db.prepare("ALTER TABLE hidden_items ADD COLUMN updated_by INTEGER").run();
+    await db.exec("ALTER TABLE hidden_items ADD COLUMN updated_at TIMESTAMP");
+    await db.exec("ALTER TABLE hidden_items ADD COLUMN updated_by INTEGER");
     console.log("Added updated_at and updated_by columns to hidden_items");
   } catch (e) {
     // Columns already exist
   }
 
   // Migration: Add Ingredients field if it doesn't exist
-  const ingredientsField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Ingredients'").get();
+  const ingredientsField = await db.get("SELECT id FROM dynamic_fields WHERE name_en = $1", ['Ingredients']);
   if (!ingredientsField) {
-    db.prepare("INSERT INTO dynamic_fields (name_en, name_ar, type, is_mandatory) VALUES (?, ?, ?, ?)").run('Ingredients', 'المكونات', 'text', 0);
+    await db.query("INSERT INTO dynamic_fields (name_en, name_ar, type, is_mandatory) VALUES ($1, $2, $3, $4)", ['Ingredients', 'المكونات', 'text', 0]);
     console.log("Added Ingredients dynamic field");
   }
 
   const roles = ["Marketing Team", "Coding Team", "Technical Team", "Call Center", "Technical Back Office", "Manager", "Restaurants", "Super Visor"];
-roles.forEach(roleName => {
-  const exists = db.prepare("SELECT id FROM roles WHERE name = ?").get(roleName);
-  if (!exists) {
-    db.prepare("INSERT INTO roles (name) VALUES (?)").run(roleName);
-  }
-});
-
-// Seed Super Visor User
-const superVisorRole = db.prepare("SELECT id FROM roles WHERE name = ?").get("Super Visor") as { id: number };
-if (superVisorRole) {
-  const username = 'Super Visor';
-  const userExists = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
-  if (!userExists) {
-    const hashedPassword = bcrypt.hashSync("supervisor123", 10);
-    db.prepare("INSERT INTO users (username, password_hash, role_id) VALUES (?, ?, ?)")
-      .run(username, hashedPassword, superVisorRole.id);
-    console.log(`Created user ${username} with role Super Visor`);
-  }
-}
-
-// Remove unwanted marketing roles and reassign users
-const marketingTeamRole = db.prepare("SELECT id FROM roles WHERE name = ?").get("Marketing Team") as { id: number };
-if (marketingTeamRole) {
-  const unwantedRoles = ["Marketing Yellow", "Marketing ERMG", "Marketing Swish"];
-  unwantedRoles.forEach(roleName => {
-    const role = db.prepare("SELECT id FROM roles WHERE name = ?").get(roleName) as { id: number } | undefined;
-    if (role) {
-      // Reassign users to Marketing Team
-      db.prepare("UPDATE users SET role_id = ? WHERE role_id = ?").run(marketingTeamRole.id, role.id);
-      // Delete the role
-      db.prepare("DELETE FROM roles WHERE id = ?").run(role.id);
-      console.log(`Removed role ${roleName} and reassigned users to Marketing Team`);
-    }
-  });
-
-  // Also remove the specific users if they exist
-  const unwantedUsers = ["marketing_yellow", "marketing_ermg", "marketing_swish", "Market", "Markett"];
-  unwantedUsers.forEach(username => {
-    db.prepare("DELETE FROM users WHERE username = ?").run(username);
-  });
-}
-
-const managerRole = db.prepare("SELECT id FROM roles WHERE name = ?").get("Manager") as { id: number };
-const adminUser = db.prepare("SELECT id FROM users WHERE username = ?").get("admin") as { id: number } | undefined;
-
-if (!adminUser && managerRole) {
-  const hashedPassword = bcrypt.hashSync("admin123", 10);
-  db.prepare("INSERT INTO users (username, password_hash, role_id) VALUES (?, ?, ?)").run("admin", hashedPassword, managerRole.id);
-  console.log("Admin user created with Manager role");
-} else if (adminUser && managerRole) {
-  // Ensure admin has Manager role
-  db.prepare("UPDATE users SET role_id = ? WHERE username = ?").run(managerRole.id, "admin");
-  console.log("Admin user role verified/updated to Manager");
-}
-
-// Seed Brands if empty
-const brandCount = db.prepare("SELECT COUNT(*) as count FROM brands").get() as { count: number };
-const brands = ["shakir", "bbt", "Slice", "pattie", "Just c", "chili", "Mishmash", "Table", "Yellow Pizza", "FM"];
-
-if (brandCount.count === 0) {
-  const insertBrand = db.prepare("INSERT INTO brands (name) VALUES (?)");
-  brands.forEach(brand => insertBrand.run(brand));
-} else {
-  // Migration: Rename yelo to Yellow Pizza if it exists
-  db.prepare("UPDATE brands SET name = 'Yellow Pizza' WHERE name = 'yelo'").run();
-  db.prepare("UPDATE brands SET name = 'Yellow Pizza' WHERE name = 'Yello Pizza'").run();
-  db.prepare("UPDATE brands SET name = 'Yellow Pizza' WHERE name = 'Yelo Pizza'").run();
-  // Migration: Rename Forevermore to FM
-  db.prepare("UPDATE brands SET name = 'FM' WHERE name = 'Forevermore'").run();
-}
-
-const allBrands = db.prepare("SELECT * FROM brands").all();
-
-const productCount = db.prepare("SELECT COUNT(*) as count FROM products").get() as { count: number };
-
-const yellowBrand = db.prepare("SELECT id FROM brands WHERE name = 'Yellow Pizza'").get() as { id: number };
-if (yellowBrand) {
-  const yellowProductCount = db.prepare("SELECT COUNT(*) as count FROM products WHERE brand_id = ?").get(yellowBrand.id) as { count: number };
-  if (yellowProductCount.count === 0) {
-    const managerUser = db.prepare("SELECT id FROM users WHERE username = 'admin'").get() as { id: number };
-    if (managerUser) {
-      const productId = db.prepare("INSERT INTO products (brand_id, created_by) VALUES (?, ?)").run(yellowBrand.id, managerUser.id).lastInsertRowid;
-      db.prepare("INSERT INTO product_field_values (product_id, field_id, value) VALUES (?, ?, ?)").run(productId, 2, "Sample Yellow Pizza");
-      console.log("Seeded sample product for Yellow Pizza");
+  for (const roleName of roles) {
+    const exists = await db.get("SELECT id FROM roles WHERE name = $1", [roleName]);
+    if (!exists) {
+      await db.query("INSERT INTO roles (name) VALUES ($1)", [roleName]);
     }
   }
-}
 
-// Seed Marketing User
-if (marketingTeamRole) {
-  const username = 'marketing_team';
-  const userExists = db.prepare("SELECT id FROM users WHERE username = ?").get(username);
-  if (!userExists) {
-    const hashedPassword = bcrypt.hashSync("marketing123", 10);
-    const result = db.prepare("INSERT INTO users (username, password_hash, role_id) VALUES (?, ?, ?)")
-      .run(username, hashedPassword, marketingTeamRole.id);
-    const userId = result.lastInsertRowid;
-    
-    // Assign some brands to marketing team by default
-    const brandsToAssign = ["Yellow Pizza", "Mishmash", "Table"];
-    const insertUserBrand = db.prepare("INSERT INTO user_brands (user_id, brand_id) VALUES (?, ?)");
-    brandsToAssign.forEach(brandName => {
-      const brand = db.prepare("SELECT id FROM brands WHERE name = ?").get(brandName) as { id: number };
-      if (brand) {
-        insertUserBrand.run(userId, brand.id);
+  // Seed Super Visor User
+  const superVisorRole = await db.get("SELECT id FROM roles WHERE name = $1", ["Super Visor"]) as { id: number };
+  if (superVisorRole) {
+    const username = 'Super Visor';
+    const userExists = await db.get("SELECT id FROM users WHERE username = $1", [username]);
+    if (!userExists) {
+      const hashedPassword = bcrypt.hashSync("supervisor123", 10);
+      await db.query("INSERT INTO users (username, password_hash, role_id) VALUES ($1, $2, $3)", [username, hashedPassword, superVisorRole.id]);
+      console.log(`Created user ${username} with role Super Visor`);
+    }
+  }
+
+  // Remove unwanted marketing roles and reassign users
+  const marketingTeamRole = await db.get("SELECT id FROM roles WHERE name = $1", ["Marketing Team"]) as { id: number };
+  if (marketingTeamRole) {
+    const unwantedRoles = ["Marketing Yellow", "Marketing ERMG", "Marketing Swish"];
+    for (const roleName of unwantedRoles) {
+      const role = await db.get("SELECT id FROM roles WHERE name = $1", [roleName]) as { id: number } | undefined;
+      if (role) {
+        // Reassign users to Marketing Team
+        await db.query("UPDATE users SET role_id = $1 WHERE role_id = $2", [marketingTeamRole.id, role.id]);
+        // Delete the role
+        await db.query("DELETE FROM roles WHERE id = $1", [role.id]);
+        console.log(`Removed role ${roleName} and reassigned users to Marketing Team`);
       }
-    });
-    console.log(`Created user ${username} with role Marketing Team and assigned brands`);
-  }
-}
+    }
 
-// Seed Branches if empty
-const branchesMap: Record<string, string[]> = {
-  "shakir": ["Rai", "Qurain", "Salmiya", "City", "Jahra", "Ardiya", "Egaila", "Hawally", "Sabah Al Ahmed"],
-  "bbt": ["Shamiya", "Hilltop", "West Mishref", "Yard (Vibes)", "Salmiya", "Adriya", "Jahra", "Adailiya", "Shuhada", "Mangaf"],
-  "Slice": ["Mishref", "City", "Yard Mall", "Adailiya", "Jabriya", "Ardiya", "Jahra"],
-  "pattie": ["Adailiya", "Mishref", "Ardiya", "Jahra", "Salmiya", "Yard", "Hawally"],
-  "Just c": ["Qortuba", "Yard"],
-  "chili": ["Qortuba", "Yard", "Hawally"],
-  "Mishmash": ["Ardiya", "Kaifan", "Mahboula", "Jabriya", "S-Salem", "S-Abdallah", "Salmiya", "Khaitan", "Mangaf", "W-Abdullah", "Salwa", "Qadsiya", "Qurain", "Khairan"],
-  "Table": ["Al-Rai", "Adriya", "Kuwait City", "Salmiya", "Hawally", "Jahra", "Egaila", "Aswaq Al-Qurain", "Sabah Al Ahmed"],
-  "Yellow Pizza": [
-    "Adailiya", "Khairan", "Jaber Al-Ahmad", "Sabah Al-Salem", "Vibes", "Qortuba", 
-    "Dahiya Abdullah", "Fahaheel", "Jleeb Al-Shuyo", "Egaila", "Salmiya", "Jabriya", 
-    "Ishbiliya (New)", "Sabah Al Ahmad", "Ardiya", "Midan Hawally", "Yard Mall", 
-    "Jahra", "Salwa", "Zahra"
-  ],
-  "FM": ["Main Branch"]
+    // Also remove the specific users if they exist
+    const unwantedUsers = ["marketing_yellow", "marketing_ermg", "marketing_swish", "Market", "Markett"];
+    for (const username of unwantedUsers) {
+      await db.query("DELETE FROM users WHERE username = $1", [username]);
+    }
+  }
+
+  const managerRole = await db.get("SELECT id FROM roles WHERE name = $1", ["Manager"]) as { id: number };
+  const adminUser = await db.get("SELECT id FROM users WHERE username = $1", ["admin"]) as { id: number } | undefined;
+
+  if (!adminUser && managerRole) {
+    const hashedPassword = bcrypt.hashSync("admin123", 10);
+    await db.query("INSERT INTO users (username, password_hash, role_id) VALUES ($1, $2, $3)", ["admin", hashedPassword, managerRole.id]);
+    console.log("Admin user created with Manager role");
+  } else if (adminUser && managerRole) {
+    // Ensure admin has Manager role
+    await db.query("UPDATE users SET role_id = $1 WHERE username = $2", [managerRole.id, "admin"]);
+    console.log("Admin user role verified/updated to Manager");
+  }
+
+  // Seed Brands if empty
+  const brandCountResult = await db.get("SELECT COUNT(*) as count FROM brands") as { count: string | number };
+  const brandCount = parseInt(brandCountResult.count.toString());
+  const brands = ["shakir", "bbt", "Slice", "pattie", "Just c", "chili", "Mishmash", "Table", "Yellow Pizza", "FM"];
+
+  if (brandCount === 0) {
+    for (const brand of brands) {
+      await db.query("INSERT INTO brands (name) VALUES ($1)", [brand]);
+    }
+  } else {
+    // Migration: Rename yelo to Yellow Pizza if it exists
+    await db.query("UPDATE brands SET name = 'Yellow Pizza' WHERE name = 'yelo'");
+    await db.query("UPDATE brands SET name = 'Yellow Pizza' WHERE name = 'Yello Pizza'");
+    await db.query("UPDATE brands SET name = 'Yellow Pizza' WHERE name = 'Yelo Pizza'");
+    // Migration: Rename Forevermore to FM
+    await db.query("UPDATE brands SET name = 'FM' WHERE name = 'Forevermore'");
+  }
+
+  const yellowBrand = await db.get("SELECT id FROM brands WHERE name = 'Yellow Pizza'") as { id: number };
+  if (yellowBrand) {
+    const yellowProductCountResult = await db.get("SELECT COUNT(*) as count FROM products WHERE brand_id = $1", [yellowBrand.id]) as { count: string | number };
+    const yellowProductCount = parseInt(yellowProductCountResult.count.toString());
+    if (yellowProductCount === 0) {
+      const managerUser = await db.get("SELECT id FROM users WHERE username = 'admin'") as { id: number };
+      if (managerUser) {
+        const productResult = await db.query("INSERT INTO products (brand_id, created_by) VALUES ($1, $2) RETURNING id", [yellowBrand.id, managerUser.id]);
+        const productId = productResult.rows[0].id;
+        await db.query("INSERT INTO product_field_values (product_id, field_id, value) VALUES ($1, $2, $3)", [productId, 2, "Sample Yellow Pizza"]);
+        console.log("Seeded sample product for Yellow Pizza");
+      }
+    }
+  }
+
+  // Seed Marketing User
+  if (marketingTeamRole) {
+    const username = 'marketing_team';
+    const userExists = await db.get("SELECT id FROM users WHERE username = $1", [username]);
+    if (!userExists) {
+      const hashedPassword = bcrypt.hashSync("marketing123", 10);
+      const result = await db.query("INSERT INTO users (username, password_hash, role_id) VALUES ($1, $2, $3) RETURNING id", [username, hashedPassword, marketingTeamRole.id]);
+      const userId = result.rows[0].id;
+      
+      // Assign some brands to marketing team by default
+      const brandsToAssign = ["Yellow Pizza", "Mishmash", "Table"];
+      for (const brandName of brandsToAssign) {
+        const brand = await db.get("SELECT id FROM brands WHERE name = $1", [brandName]) as { id: number };
+        if (brand) {
+          await db.query("INSERT INTO user_brands (user_id, brand_id) VALUES ($1, $2)", [userId, brand.id]);
+        }
+      }
+      console.log(`Created user ${username} with role Marketing Team and assigned brands`);
+    }
+  }
+
+  // Seed Branches if empty
+  const branchesMap: Record<string, string[]> = {
+    "shakir": ["Rai", "Qurain", "Salmiya", "City", "Jahra", "Ardiya", "Egaila", "Hawally", "Sabah Al Ahmed"],
+    "bbt": ["Shamiya", "Hilltop", "West Mishref", "Yard (Vibes)", "Salmiya", "Adriya", "Jahra", "Adailiya", "Shuhada", "Mangaf"],
+    "Slice": ["Mishref", "City", "Yard Mall", "Adailiya", "Jabriya", "Ardiya", "Jahra"],
+    "pattie": ["Adailiya", "Mishref", "Ardiya", "Jahra", "Salmiya", "Yard", "Hawally"],
+    "Just c": ["Qortuba", "Yard"],
+    "chili": ["Qortuba", "Yard", "Hawally"],
+    "Mishmash": ["Ardiya", "Kaifan", "Mahboula", "Jabriya", "S-Salem", "S-Abdallah", "Salmiya", "Khaitan", "Mangaf", "W-Abdullah", "Salwa", "Qadsiya", "Qurain", "Khairan"],
+    "Table": ["Al-Rai", "Adriya", "Kuwait City", "Salmiya", "Hawally", "Jahra", "Egaila", "Aswaq Al-Qurain", "Sabah Al Ahmed"],
+    "Yellow Pizza": [
+      "Adailiya", "Khairan", "Jaber Al-Ahmad", "Sabah Al-Salem", "Vibes", "Qortuba", 
+      "Dahiya Abdullah", "Fahaheel", "Jleeb Al-Shuyo", "Egaila", "Salmiya", "Jabriya", 
+      "Ishbiliya (New)", "Sabah Al Ahmad", "Ardiya", "Midan Hawally", "Yard Mall", 
+      "Jahra", "Salwa", "Zahra"
+    ],
+    "FM": ["Main Branch"]
+  };
+
+  for (const [brandName, branches] of Object.entries(branchesMap)) {
+    const brand = await db.get("SELECT id FROM brands WHERE name = $1", [brandName]) as { id: number };
+    if (brand) {
+      for (const branchName of branches) {
+        const exists = await db.get("SELECT id FROM branches WHERE brand_id = $1 AND name = $2", [brand.id, branchName]);
+        if (!exists) {
+          await db.query("INSERT INTO branches (brand_id, name) VALUES ($1, $2)", [brand.id, branchName]);
+        }
+      }
+    }
+  }
+
+  // Seed Dynamic Fields
+  const fields = [
+    { name_en: "Category Name (EN)", name_ar: "اسم الفئة (EN)", type: "text", is_mandatory: 1 },
+    { name_en: "Product Name (EN)", name_ar: "اسم المنتج (EN)", type: "text", is_mandatory: 1 },
+    { name_en: "Description (EN)", name_ar: "الوصف (EN)", type: "text", is_mandatory: 1 },
+    { name_en: "Price", name_ar: "السعر", type: "number", is_mandatory: 1 },
+    { name_en: "Category Name (AR)", name_ar: "اسم الفئة (AR)", type: "text", is_mandatory: 1 },
+    { name_en: "Product Name (AR)", name_ar: "اسم المنتج (AR)", type: "text", is_mandatory: 1 },
+    { name_en: "Description (AR)", name_ar: "الوصف (AR)", type: "text", is_mandatory: 1 },
+    { name_en: "Ingredients", name_ar: "المكونات", type: "text", is_mandatory: 0 },
+    { name_en: "Sticker", name_ar: "ملصق", type: "text", is_mandatory: 0 },
+    { name_en: "Deal Category", name_ar: "فئة العرض", type: "text", is_mandatory: 0 }
+  ];
+
+  for (const f of fields) {
+    const exists = await db.get("SELECT id FROM dynamic_fields WHERE name_en = $1", [f.name_en]);
+    if (!exists) {
+      await db.query("INSERT INTO dynamic_fields (name_en, name_ar, type, is_mandatory) VALUES ($1, $2, $3, $4)", [f.name_en, f.name_ar, f.type, f.is_mandatory]);
+    }
+  }
+
+  // Seed Busy Branch Config if empty
+  const reasonCountResult = await db.get("SELECT COUNT(*) as count FROM busy_branch_reasons") as { count: string | number };
+  const reasonCount = parseInt(reasonCountResult.count.toString());
+  if (reasonCount === 0) {
+    const reasons = ["High Volume", "System Down", "Staff Shortage", "Equipment Failure", "Other"];
+    for (const r of reasons) {
+      await db.query("INSERT INTO busy_branch_reasons (name) VALUES ($1)", [r]);
+    }
+  }
+
+  const respCountResult = await db.get("SELECT COUNT(*) as count FROM busy_branch_responsible") as { count: string | number };
+  const respCount = parseInt(respCountResult.count.toString());
+  const newResponsible = ["Store", "Warhorse", "Bakery", "CPU", "Logistics"];
+
+  if (respCount === 0) {
+    for (const r of newResponsible) {
+      await db.query("INSERT INTO busy_branch_responsible (name) VALUES ($1)", [r]);
+    }
+  } else {
+    const currentResp = await db.all("SELECT name FROM busy_branch_responsible") as { name: string }[];
+    const hasOldDefaults = currentResp.some(r => r.name === "Operations" || r.name === "IT Support");
+    
+    if (hasOldDefaults) {
+      await db.query("DELETE FROM busy_branch_responsible");
+      for (const r of newResponsible) {
+        await db.query("INSERT INTO busy_branch_responsible (name) VALUES ($1)", [r]);
+      }
+    }
+  }
+
+// Helper functions for product seeding
+const getCategory = (itemName: string) => {
+  const lower = itemName.toLowerCase();
+  if (lower.includes("pizza")) return { en: "Pizza", ar: "بيتزا" };
+  if (lower.includes("burger") || lower.includes("slider") || lower.includes("pattie")) return { en: "Burgers", ar: "برجر" };
+  if (lower.includes("drink") || lower.includes("cola") || lower.includes("pepsi") || lower.includes("water") || lower.includes("juice") || lower.includes("latte") || lower.includes("shake")) return { en: "Drinks", ar: "مشروبات" };
+  if (lower.includes("fries") || lower.includes("wedges") || lower.includes("nuggets") || lower.includes("wings") || lower.includes("bites") || lower.includes("bread")) return { en: "Sides & Appetizers", ar: "مقبلات وجوانب" };
+  if (lower.includes("salad") || lower.includes("fattoush") || lower.includes("tabboulah") || lower.includes("rocca")) return { en: "Salads", ar: "سلطات" };
+  if (lower.includes("wrap") || lower.includes("sandwich") || lower.includes("roll") || lower.includes("arayes")) return { en: "Sandwiches & Wraps", ar: "ساندوتشات ولفائف" };
+  if (lower.includes("rice bowl") || lower.includes("bowl") || lower.includes("platter") || lower.includes("meal") || lower.includes("box")) return { en: "Meals & Bowls", ar: "وجبات وأطباق" };
+  if (lower.includes("dessert") || lower.includes("cookie") || lower.includes("pancake") || lower.includes("oats") || lower.includes("parfait")) return { en: "Desserts", ar: "حلويات" };
+  if (lower.includes("sauce") || lower.includes("mayo") || lower.includes("ranch") || lower.includes("dip")) return { en: "Sauces", ar: "صوصات" };
+  return { en: "Main Course", ar: "طبق رئيسي" };
 };
 
-const insertBranch = db.prepare("INSERT INTO branches (brand_id, name) VALUES (?, ?)");
-const checkBranch = db.prepare("SELECT id FROM branches WHERE brand_id = ? AND name = ?");
+const getDescription = (itemName: string) => {
+  return {
+    en: `Freshly prepared ${itemName} with high-quality ingredients.`,
+    ar: `${itemName} طازج محضر من أجود المكونات.`
+  };
+};
 
-Object.entries(branchesMap).forEach(([brandName, branches]) => {
-  const brand = db.prepare("SELECT id FROM brands WHERE name = ?").get(brandName) as { id: number };
-  if (brand) {
-    branches.forEach(branchName => {
-      const exists = checkBranch.get(brand.id, branchName);
-      if (!exists) {
-        insertBranch.run(brand.id, branchName);
-      }
-    });
-  }
-});
-
-// Seed Dynamic Fields
-const fields = [
-  { name_en: "Category Name (EN)", name_ar: "اسم الفئة (EN)", type: "text", is_mandatory: 1 },
-  { name_en: "Product Name (EN)", name_ar: "اسم المنتج (EN)", type: "text", is_mandatory: 1 },
-  { name_en: "Description (EN)", name_ar: "الوصف (EN)", type: "text", is_mandatory: 1 },
-  { name_en: "Price", name_ar: "السعر", type: "number", is_mandatory: 1 },
-  { name_en: "Category Name (AR)", name_ar: "اسم الفئة (AR)", type: "text", is_mandatory: 1 },
-  { name_en: "Product Name (AR)", name_ar: "اسم المنتج (AR)", type: "text", is_mandatory: 1 },
-  { name_en: "Description (AR)", name_ar: "الوصف (AR)", type: "text", is_mandatory: 1 },
-  { name_en: "Sticker", name_ar: "ملصق", type: "text", is_mandatory: 0 },
-  { name_en: "Deal Category", name_ar: "فئة العرض", type: "text", is_mandatory: 0 }
-];
-
-const insertField = db.prepare("INSERT INTO dynamic_fields (name_en, name_ar, type, is_mandatory) VALUES (?, ?, ?, ?)");
-const checkField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = ?");
-
-fields.forEach(f => {
-  const exists = checkField.get(f.name_en);
-  if (!exists) {
-    insertField.run(f.name_en, f.name_ar, f.type, f.is_mandatory);
-  }
-});
-
-// Seed Busy Branch Config if empty
-const reasonCount = db.prepare("SELECT COUNT(*) as count FROM busy_branch_reasons").get() as { count: number };
-if (reasonCount.count === 0) {
-  const reasons = ["High Volume", "System Down", "Staff Shortage", "Equipment Failure", "Other"];
-  const insertReason = db.prepare("INSERT INTO busy_branch_reasons (name) VALUES (?)");
-  reasons.forEach(r => insertReason.run(r));
-}
-
-const respCount = db.prepare("SELECT COUNT(*) as count FROM busy_branch_responsible").get() as { count: number };
-const newResponsible = ["Store", "Warhorse", "Bakery", "CPU", "Logistics"];
-
-if (respCount.count === 0) {
-  const insertResp = db.prepare("INSERT INTO busy_branch_responsible (name) VALUES (?)");
-  newResponsible.forEach(r => insertResp.run(r));
-} else {
-  // Check if we have the old default values and replace them if requested
-  const currentResp = db.prepare("SELECT name FROM busy_branch_responsible").all() as { name: string }[];
-  const hasOldDefaults = currentResp.some(r => r.name === "Operations" || r.name === "IT Support");
-  
-  if (hasOldDefaults) {
-    db.prepare("DELETE FROM busy_branch_responsible").run();
-    const insertResp = db.prepare("INSERT INTO busy_branch_responsible (name) VALUES (?)");
-    newResponsible.forEach(r => insertResp.run(r));
-  }
-}
+const getPrice = () => (Math.random() * 4 + 1.5).toFixed(3);
 
 // Seed Forevermore products for Hide Item demo
 const productSeedingData: Record<string, string[]> = {
@@ -903,52 +1047,97 @@ const productSeedingData: Record<string, string[]> = {
   ]
 };
 
-  const productNameField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Product Name (EN)'").get() as { id: number } | undefined;
-  const productNameFieldId = productNameField?.id || 3;
-  const categoryNameField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Category Name (EN)'").get() as { id: number } | undefined;
-  const categoryNameFieldId = categoryNameField?.id || 2;
+  const fieldNames = [
+    "Category Name (EN)", "Product Name (EN)", "Description (EN)", "Price",
+    "Category Name (AR)", "Product Name (AR)", "Description (AR)", "Ingredients"
+  ];
+  const fieldIdMap: Record<string, number> = {};
+  for (const name of fieldNames) {
+    const field = await db.get("SELECT id FROM dynamic_fields WHERE name_en = $1", [name]) as { id: number } | undefined;
+    if (field) fieldIdMap[name] = field.id;
+  }
 
-  // Migration: Fix existing data where product names were incorrectly put into Category Name (EN) field
-  if (productNameFieldId && categoryNameFieldId) {
-    // Find all products for the brands we seeded
-    const seededBrandNames = Object.keys(productSeedingData);
-    const placeholders = seededBrandNames.map(() => '?').join(',');
-    const seededBrandIds = db.prepare(`SELECT id FROM brands WHERE name IN (${placeholders})`).all(...seededBrandNames).map((b: any) => b.id);
-    
-    if (seededBrandIds.length > 0) {
-      const brandPlaceholders = seededBrandIds.map(() => '?').join(',');
-      // Move values from Category Name field to Product Name field if Product Name field is empty
-      db.prepare(`
-        UPDATE product_field_values 
-        SET field_id = ? 
-        WHERE field_id = ? 
-        AND product_id IN (SELECT id FROM products WHERE brand_id IN (${brandPlaceholders}))
-        AND product_id NOT IN (SELECT product_id FROM product_field_values WHERE field_id = ?)
-      `).run(productNameFieldId, categoryNameFieldId, ...seededBrandIds, productNameFieldId);
+  for (const [brandName, items] of Object.entries(productSeedingData)) {
+    const brand = await db.get("SELECT id FROM brands WHERE name = $1", [brandName]) as { id: number };
+    if (brand) {
+      for (const itemName of items) {
+        const productNameFieldId = fieldIdMap["Product Name (EN)"];
+        if (!productNameFieldId) continue;
+
+        const exists = await db.get(`
+          SELECT p.id 
+          FROM products p 
+          JOIN product_field_values fv ON p.id = fv.product_id 
+          WHERE p.brand_id = $1 AND fv.field_id = $2 AND fv.value = $3
+        `, [brand.id, productNameFieldId, itemName]) as { id: number } | undefined;
+        
+        let productId: number;
+        
+        if (!exists) {
+          const result = await db.query("INSERT INTO products (brand_id, created_by) VALUES ($1, $2) RETURNING id", [brand.id, 1]); // Admin user
+          productId = result.rows[0].id;
+        } else {
+          productId = exists.id;
+        }
+        
+        const category = getCategory(itemName);
+        const description = getDescription(itemName);
+        const price = getPrice();
+        const ingredients = `Sample ingredients for ${itemName}: Flour, Water, Salt, and Secret Spices.`;
+
+        const values = [
+          { name: "Category Name (EN)", val: category.en },
+          { name: "Product Name (EN)", val: itemName },
+          { name: "Description (EN)", val: description.en },
+          { name: "Price", val: price },
+          { name: "Category Name (AR)", val: category.ar },
+          { name: "Product Name (AR)", val: itemName }, // Using EN name as fallback for AR
+          { name: "Description (AR)", val: description.ar },
+          { name: "Ingredients", val: ingredients }
+        ];
+
+        for (const v of values) {
+          const fieldId = fieldIdMap[v.name];
+          if (fieldId) {
+            // Check if value already exists for this field
+            const valueExists = await db.get("SELECT 1 FROM product_field_values WHERE product_id = $1 AND field_id = $2", [productId, fieldId]);
+            if (!valueExists) {
+              await db.query("INSERT INTO product_field_values (product_id, field_id, value) VALUES ($1, $2, $3)", [productId, fieldId, v.val]);
+            }
+          }
+        }
+
+        // Add sample modifiers if none exist
+        const modifierExists = await db.get("SELECT 1 FROM modifier_groups WHERE product_id = $1", [productId]);
+        if (!modifierExists) {
+          if (category.en === "Pizza") {
+            const groupResult = await db.query("INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id", [productId, "Crust Type", "نوع العجينة", "single", 1, 1, 1]);
+            const groupId = groupResult.rows[0].id;
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Thin Crust", "عجينة رقيقة", 0]);
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Pan Pizza", "بان بيتزا", 0.5]);
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Cheesy Crust", "عجينة محشوة بالجبن", 1.0]);
+          } else if (category.en === "Burgers") {
+            const groupResult = await db.query("INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id", [productId, "Extra Toppings", "إضافات", "multiple", 0, 0, 3]);
+            const groupId = groupResult.rows[0].id;
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Extra Cheese", "جبنة إضافية", 0.250]);
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Beef Bacon", "لحم بقري مقدد", 0.500]);
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Jalapenos", "هالبينو", 0.150]);
+          } else if (category.en === "Drinks") {
+            const groupResult = await db.query("INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id", [productId, "Size", "الحجم", "single", 1, 1, 1]);
+            const groupId = groupResult.rows[0].id;
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Small", "صغير", 0]);
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Medium", "وسط", 0.250]);
+            await db.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment) VALUES ($1, $2, $3, $4)", [groupId, "Large", "كبير", 0.500]);
+          }
+        }
+      }
     }
   }
 
-  const insertProduct = db.prepare("INSERT INTO products (brand_id, created_by) VALUES (?, ?)");
-  const insertValue = db.prepare("INSERT INTO product_field_values (product_id, field_id, value) VALUES (?, ?, ?)");
-  const checkProduct = db.prepare("SELECT p.id FROM products p JOIN product_field_values fv ON p.id = fv.product_id WHERE p.brand_id = ? AND fv.field_id = ? AND fv.value = ?");
-
-  Object.entries(productSeedingData).forEach(([brandName, items]) => {
-    const brand = db.prepare("SELECT id FROM brands WHERE name = ?").get(brandName) as { id: number };
-    if (brand) {
-      items.forEach(itemName => {
-        const exists = checkProduct.get(brand.id, productNameFieldId, itemName);
-        if (!exists) {
-          const result = insertProduct.run(brand.id, 1); // Admin user
-          const productId = result.lastInsertRowid;
-          insertValue.run(productId, productNameFieldId, itemName); // Use dynamic field ID
-        }
-      });
-    }
-  });
-
   // Seed Call Center Platforms
-  const platformCount = db.prepare("SELECT COUNT(*) as count FROM call_center_platforms").get() as { count: number };
-  if (platformCount.count === 0) {
+  const platformCountResult = await db.get("SELECT COUNT(*) as count FROM call_center_platforms") as { count: string | number };
+  const platformCount = parseInt(platformCountResult.count.toString());
+  if (platformCount === 0) {
     const platforms = [
       { en: "Deliveroo", ar: "دليفرو" },
       { en: "Talabat", ar: "طلبات" },
@@ -961,13 +1150,15 @@ const productSeedingData: Record<string, string[]> = {
       { en: "V-thru", ar: "في-ثرو" },
       { en: "Keeta", ar: "كيتا" }
     ];
-    const insertPlatform = db.prepare("INSERT INTO call_center_platforms (name_en, name_ar) VALUES (?, ?)");
-    platforms.forEach(p => insertPlatform.run(p.en, p.ar));
+    for (const p of platforms) {
+      await db.query("INSERT INTO call_center_platforms (name_en, name_ar) VALUES ($1, $2)", [p.en, p.ar]);
+    }
   }
 
   // Seed Call Center Case Types
-  const caseTypeCount = db.prepare("SELECT COUNT(*) as count FROM call_center_case_types").get() as { count: number };
-  if (caseTypeCount.count === 0) {
+  const caseTypeCountResult = await db.get("SELECT COUNT(*) as count FROM call_center_case_types") as { count: string | number };
+  const caseTypeCount = parseInt(caseTypeCountResult.count.toString());
+  if (caseTypeCount === 0) {
     const caseTypes = [
       { en: "Late Order", ar: "طلب متأخر" },
       { en: "Wrong Item", ar: "صنف خطأ" },
@@ -979,13 +1170,15 @@ const productSeedingData: Record<string, string[]> = {
       { en: "Inquiry", ar: "استفسار" },
       { en: "Suggestion", ar: "اقتراح" }
     ];
-    const insertCaseType = db.prepare("INSERT INTO call_center_case_types (name_en, name_ar) VALUES (?, ?)");
-    caseTypes.forEach(c => insertCaseType.run(c.en, c.ar));
+    for (const c of caseTypes) {
+      await db.query("INSERT INTO call_center_case_types (name_en, name_ar) VALUES ($1, $2)", [c.en, c.ar]);
+    }
   }
 
   // Seed Technical Case Types
-  const techTypeCount = db.prepare("SELECT COUNT(*) as count FROM technical_case_types").get() as { count: number };
-  if (techTypeCount.count === 0) {
+  const techTypeCountResult = await db.get("SELECT COUNT(*) as count FROM technical_case_types") as { count: string | number };
+  const techTypeCount = parseInt(techTypeCountResult.count.toString());
+  if (techTypeCount === 0) {
     const techTypes = [
       { en: "System Down", ar: "النظام معطل" },
       { en: "Printer Issue", ar: "مشكلة طابعة" },
@@ -993,25 +1186,15 @@ const productSeedingData: Record<string, string[]> = {
       { en: "Tablet Issue", ar: "مشكلة تابلت" },
       { en: "Other", ar: "أخرى" }
     ];
-    const insertTechType = db.prepare("INSERT INTO technical_case_types (name_en, name_ar) VALUES (?, ?)");
-    techTypes.forEach(t => insertTechType.run(t.en, t.ar));
+    for (const t of techTypes) {
+      await db.query("INSERT INTO technical_case_types (name_en, name_ar) VALUES ($1, $2)", [t.en, t.ar]);
+    }
   }
 }
 
 async function startServer() {
   console.log("Starting server...");
   
-  try {
-    console.log("SQLite initialized.");
-    await initDb();
-    console.log("Database schema initialized.");
-    // await seedData(); // If you have a seedData function, call it here
-    console.log("Database seeded.");
-  } catch (dbErr) {
-    console.error("Failed to initialize database:", dbErr);
-  }
-
-  console.log("NODE_ENV:", process.env.NODE_ENV);
   const app = express();
   app.use(cors());
   const server = http.createServer(app);
@@ -1026,10 +1209,27 @@ async function startServer() {
     next();
   });
 
-  // Health check
-  app.get("/api/health", (req, res) => {
+  // Initialize Database in background to avoid blocking server startup
+  (async () => {
     try {
-      const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get();
+      console.log("Connecting to PostgreSQL...");
+      await initDb();
+      console.log("Database schema initialized successfully on PostgreSQL.");
+      await seedData(); 
+      console.log("Database initialization complete.");
+    } catch (dbErr) {
+      console.error("CRITICAL ERROR: Failed to initialize database.");
+      console.error("Check your DATABASE_URL environment variable.");
+      console.error("Error details:", dbErr);
+    }
+  })();
+
+  console.log("NODE_ENV:", process.env.NODE_ENV);
+
+  // Health check
+  app.get("/api/health", async (req, res) => {
+    try {
+      const userCount = await db.get("SELECT COUNT(*) as count FROM users");
       res.json({ 
         status: "ok", 
         timestamp: new Date().toISOString(),
@@ -1054,19 +1254,19 @@ async function startServer() {
     });
   };
 
-  const getProductNameFieldId = () => {
-    const field = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Product Name (EN)'").get() as { id: number } | undefined;
+  const getProductNameFieldId = async () => {
+    const field = await db.get("SELECT id FROM dynamic_fields WHERE name_en = 'Product Name (EN)'") as { id: number } | undefined;
     return field?.id || 3;
   };
 
   // Middleware: Auth
-  const authenticate = (req: any, res: any, next: any) => {
+  const authenticate = async (req: any, res: any, next: any) => {
     const token = req.headers.authorization?.split(" ")[1];
     if (!token) return res.status(401).json({ error: "Unauthorized" });
     try {
       const decoded = jwt.verify(token, JWT_SECRET) as any;
       // Fetch fresh user data to ensure role_id is correct after DB resets
-      const freshUser = db.prepare("SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?").get(decoded.id) as any;
+      const freshUser = await db.get("SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1", [decoded.id]) as any;
       if (!freshUser) return res.status(401).json({ error: "User no longer exists" });
       req.user = freshUser;
       next();
@@ -1079,20 +1279,14 @@ async function startServer() {
   const authorize = (roles: string[]) => (req: any, res: any, next: any) => {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
     if (!roles.includes(req.user.role_name)) {
-      console.warn(`Access denied for user ${req.user.username}. Role ${req.user.role_name} not in [${roles.join(", ")}]`);
+      console.warn(`Access denied for user ${req.user.username}. Role ${req.user.role_name} not in ${roles.join(", ")}`);
       return res.status(403).json({ error: "Forbidden" });
     }
     next();
   };
 
-  // Audit Log Helper
-  const logAction = (userId: number, action: string, table: string, id?: number, oldVal?: any, newVal?: any) => {
-    db.prepare("INSERT INTO audit_logs (user_id, action, target_table, target_id, old_value, new_value, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(userId, action, table, id || null, oldVal ? JSON.stringify(oldVal) : null, newVal ? JSON.stringify(newVal) : null, getCurrentKuwaitTime());
-  };
-
   // Pending Requests API
-  app.get("/api/pending-requests", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor", "Restaurants"]), (req, res) => {
+  app.get("/api/pending-requests", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor", "Restaurants"]), async (req, res) => {
     let query = `
       SELECT pr.*, u.username, p.username as processor_name
       FROM pending_requests pr
@@ -1102,27 +1296,27 @@ async function startServer() {
     let params: any[] = [];
 
     if ((req as any).user.role_name === 'Restaurants') {
-      query += " WHERE pr.user_id = ?";
+      query += " WHERE pr.user_id = $1";
       params.push((req as any).user.id);
     }
 
     query += " ORDER BY pr.created_at DESC";
     
-    const requests = db.prepare(query).all(...params);
+    const requests = await db.all(query, params);
     
-    const parsedRequests = requests.map((r: any) => {
+    const parsedRequests = await Promise.all(requests.map(async (r: any) => {
       const data = JSON.parse(r.data);
       
       if (r.type === 'hide_unhide') {
         // Resolve Brand Name
         if (data.brand_id) {
-          const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(data.brand_id) as { name: string };
+          const brand = await db.get("SELECT name FROM brands WHERE id = $1", [data.brand_id]) as { name: string };
           data.brand_name = brand?.name || 'Unknown';
         }
         
         // Resolve Branch Name
         if (data.branch_id) {
-          const branch = db.prepare("SELECT name FROM branches WHERE id = ?").get(data.branch_id) as { name: string };
+          const branch = await db.get("SELECT name FROM branches WHERE id = $1", [data.branch_id]) as { name: string };
           data.branch_name = branch?.name || 'Unknown';
         } else {
           data.branch_name = 'All Branches';
@@ -1130,13 +1324,13 @@ async function startServer() {
         
         // Resolve Product Names
         if (data.product_ids && data.product_ids.length > 0) {
-          const productNameFieldId = getProductNameFieldId();
-          const placeholders = data.product_ids.map(() => '?').join(',');
-          const products = db.prepare(`
+          const productNameFieldId = await getProductNameFieldId();
+          const placeholders = data.product_ids.map((_: any, i: number) => `$${i + 2}`).join(',');
+          const products = await db.all(`
             SELECT fv.product_id, fv.value as name
             FROM product_field_values fv
-            WHERE fv.field_id = ? AND fv.product_id IN (${placeholders})
-          `).all(productNameFieldId, ...data.product_ids) as { product_id: number, name: string }[];
+            WHERE fv.field_id = $1 AND fv.product_id IN (${placeholders})
+          `, [productNameFieldId, ...data.product_ids]) as { product_id: number, name: string }[];
           data.resolved_products = products;
         }
       }
@@ -1145,25 +1339,25 @@ async function startServer() {
         ...r,
         data
       };
-    });
+    }));
     
     res.json(parsedRequests);
   });
 
-  app.post("/api/pending-requests", authenticate, (req, res) => {
+  app.post("/api/pending-requests", authenticate, async (req, res) => {
     const { type, data } = req.body;
-    const result = db.prepare(`
+    const result = await db.query(`
       INSERT INTO pending_requests (user_id, type, data)
-      VALUES (?, ?, ?)
-    `).run((req as any).user.id, type, JSON.stringify(data));
+      VALUES ($1, $2, $3) RETURNING id
+    `, [(req as any).user.id, type, JSON.stringify(data)]);
     
     broadcast({ type: "PENDING_REQUEST_CREATED" });
-    res.json({ id: result.lastInsertRowid });
+    res.json({ id: result.rows[0].id });
   });
 
-  app.post("/api/pending-requests/:id/approve", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/pending-requests/:id/approve", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
     const { id } = req.params;
-    const request = db.prepare("SELECT * FROM pending_requests WHERE id = ?").get(id) as any;
+    const request = await db.get("SELECT * FROM pending_requests WHERE id = $1", [id]) as any;
     
     if (!request || request.status !== 'Pending') {
       return res.status(400).json({ error: "Invalid request" });
@@ -1173,52 +1367,59 @@ async function startServer() {
     
     try {
       if (request.type === 'hide_unhide') {
-        const insertHidden = db.prepare(`
-          INSERT INTO hidden_items (
-            user_id, brand_id, branch_id, product_id, agent_name, reason, 
-            action_to_unhide, comment, requested_at, responsible_party
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
-        const insertHistory = db.prepare(`
-          INSERT INTO hide_history (
-            user_id, brand_id, branch_id, product_id, action,
-            agent_name, reason, action_to_unhide, comment, requested_at, responsible_party
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-
         if (data.branch_id === null) {
-          const branches = db.prepare("SELECT id FROM branches WHERE brand_id = ?").all(data.brand_id) as { id: number }[];
+          const branches = await db.all("SELECT id FROM branches WHERE brand_id = $1", [data.brand_id]) as { id: number }[];
           for (const productId of data.product_ids) {
             for (const branch of branches) {
-              insertHidden.run(request.user_id, data.brand_id, branch.id, productId, data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party);
-              insertHistory.run(request.user_id, data.brand_id, branch.id, productId, 'HIDE', data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party);
+              await db.query(`
+                INSERT INTO hidden_items (
+                  user_id, brand_id, branch_id, product_id, agent_name, reason, 
+                  action_to_unhide, comment, requested_at, responsible_party
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+              `, [request.user_id, data.brand_id, branch.id, productId, data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party]);
+              
+              await db.query(`
+                INSERT INTO hide_history (
+                  user_id, brand_id, branch_id, product_id, action,
+                  agent_name, reason, action_to_unhide, comment, requested_at, responsible_party
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+              `, [request.user_id, data.brand_id, branch.id, productId, 'HIDE', data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party]);
             }
           }
         } else {
           for (const productId of data.product_ids) {
-            insertHidden.run(request.user_id, data.brand_id, data.branch_id, productId, data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party);
-            insertHistory.run(request.user_id, data.brand_id, data.branch_id, productId, 'HIDE', data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party);
+            await db.query(`
+              INSERT INTO hidden_items (
+                user_id, brand_id, branch_id, product_id, agent_name, reason, 
+                action_to_unhide, comment, requested_at, responsible_party
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            `, [request.user_id, data.brand_id, data.branch_id, productId, data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party]);
+            
+            await db.query(`
+              INSERT INTO hide_history (
+                user_id, brand_id, branch_id, product_id, action,
+                agent_name, reason, action_to_unhide, comment, requested_at, responsible_party
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            `, [request.user_id, data.brand_id, data.branch_id, productId, 'HIDE', data.agent_name, data.reason, data.action_to_unhide, data.comment, data.requested_at, data.responsible_party]);
           }
         }
         broadcast({ type: "HIDDEN_ITEMS_UPDATED" });
       } else if (request.type === 'busy_branch') {
-        db.prepare(`
+        await db.query(`
           INSERT INTO busy_period_records (
             user_id, date, brand, branch, start_time, end_time, 
             total_duration, total_duration_minutes, reason_category, responsible_party, 
             comment, internal_notes
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        `, [
           request.user_id, data.date, data.brand, data.branch, data.start_time, data.end_time,
           data.total_duration, data.total_duration_minutes || 0, data.reason_category, data.responsible_party,
           data.comment, data.internal_notes
-        );
+        ]);
         broadcast({ type: "BUSY_PERIOD_CREATED" });
       }
       
-      db.prepare("UPDATE pending_requests SET status = 'Approved', processed_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .run((req as any).user.id, id);
+      await db.query("UPDATE pending_requests SET status = 'Approved', processed_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [(req as any).user.id, id]);
         
       broadcast({ type: "PENDING_REQUEST_UPDATED" });
       res.json({ success: true });
@@ -1228,10 +1429,9 @@ async function startServer() {
     }
   });
 
-  app.post("/api/pending-requests/:id/reject", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/pending-requests/:id/reject", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
     const { id } = req.params;
-    db.prepare("UPDATE pending_requests SET status = 'Rejected', processed_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run((req as any).user.id, id);
+    await db.query("UPDATE pending_requests SET status = 'Rejected', processed_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [(req as any).user.id, id]);
       
     broadcast({ type: "PENDING_REQUEST_UPDATED" });
     res.json({ success: true });
@@ -1239,67 +1439,77 @@ async function startServer() {
 
   // Late Order Requests
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN call_center_message TEXT");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN call_center_message TEXT");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN case_type TEXT DEFAULT 'Late Order'");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN case_type TEXT DEFAULT 'Late Order'");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN dedication_time DATETIME");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN dedication_time TIMESTAMP");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN alert_sent INTEGER DEFAULT 0");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN alert_sent INTEGER DEFAULT 0");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN restaurant_response_at DATETIME");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN restaurant_response_at TIMESTAMP");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN manager_viewed_at DATETIME");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN manager_viewed_at TIMESTAMP");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN manager_responded_at DATETIME");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN manager_responded_at TIMESTAMP");
   } catch (e) {}
   try {
-    db.exec("ALTER TABLE late_order_requests ADD COLUMN restaurant_viewed_at DATETIME");
+    await db.exec("ALTER TABLE late_order_requests ADD COLUMN restaurant_viewed_at TIMESTAMP");
   } catch (e) {}
 
   // Late Order Alert Checker
-  setInterval(() => {
+  setInterval(async () => {
     const now = new Date();
-    const pendingAlerts = db.prepare(`
-      SELECT lo.*, b.name as brand_name, br.name as branch_name
-      FROM late_order_requests lo
-      JOIN brands b ON lo.brand_id = b.id
-      JOIN branches br ON lo.branch_id = br.id
-      WHERE lo.case_type = 'Dedication' 
-      AND lo.alert_sent = 0
-    `).all() as any[];
-
-    pendingAlerts.forEach(alert => {
-      if (!alert.dedication_time) return;
-      
-      const dTime = new Date(alert.dedication_time);
-      if (dTime <= now) {
-        broadcast({
-          type: "DEDICATION_ALERT",
-          data: {
-            id: alert.id,
-            order_id: alert.order_id,
-            customer_name: alert.customer_name,
-            brand_name: alert.brand_name,
-            branch_name: alert.branch_name,
-            branch_id: alert.branch_id,
-            call_center_user_id: alert.call_center_user_id,
-            brand_id: alert.brand_id
-          }
-        });
-
-        db.prepare("UPDATE late_order_requests SET alert_sent = 1 WHERE id = ?").run(alert.id);
+    try {
+      // Basic check for internal Railway URL to avoid spamming errors
+      if (process.env.DATABASE_URL?.includes('postgres.railway.internal')) {
+        console.warn("CRITICAL: You are using an INTERNAL Railway URL. Please update DATABASE_URL in Settings to use the PUBLIC URL (DATABASE_PUBLIC_URL).");
+        return;
       }
-    });
+
+      const pendingAlerts = await db.all(`
+        SELECT lo.*, b.name as brand_name, br.name as branch_name
+        FROM late_order_requests lo
+        JOIN brands b ON lo.brand_id = b.id
+        JOIN branches br ON lo.branch_id = br.id
+        WHERE lo.case_type = 'Dedication' 
+        AND lo.alert_sent = 0
+      `) as any[];
+
+      for (const alert of pendingAlerts) {
+        if (!alert.dedication_time) continue;
+        
+        const dTime = new Date(alert.dedication_time);
+        if (dTime <= now) {
+          broadcast({
+            type: "DEDICATION_ALERT",
+            data: {
+              id: alert.id,
+              order_id: alert.order_id,
+              customer_name: alert.customer_name,
+              brand_name: alert.brand_name,
+              branch_name: alert.branch_name,
+              branch_id: alert.branch_id,
+              call_center_user_id: alert.call_center_user_id,
+              brand_id: alert.brand_id
+            }
+          });
+
+          await db.query("UPDATE late_order_requests SET alert_sent = 1 WHERE id = $1", [alert.id]);
+        }
+      }
+    } catch (err) {
+      console.error("Error in Late Order Alert Checker:", err);
+    }
   }, 10000); // Check every 10 seconds for better precision
 
-  app.post("/api/late-orders", authenticate, authorize(["Call Center", "Restaurants", "Technical Back Office"]), (req, res) => {
+  app.post("/api/late-orders", authenticate, authorize(["Call Center", "Restaurants", "Technical Back Office"]), async (req, res) => {
     const { brand_id, branch_id, customer_name, customer_phone, order_id, platform, call_center_message, case_type, technical_type, dedication_time, dynamic_values, complaint_source } = req.body;
     
     // Validation for Dedication
@@ -1319,18 +1529,17 @@ async function startServer() {
       }
     }
 
-    const result = db.prepare(`
+    const result = await db.query(`
       INSERT INTO late_order_requests (call_center_user_id, brand_id, branch_id, customer_name, customer_phone, order_id, platform, call_center_message, case_type, technical_type, dedication_time, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run((req as any).user.id, brand_id, branch_id, customer_name, customer_phone, order_id, platform, call_center_message, case_type || 'Late Order', technical_type, isoDedicationTime, getCurrentKuwaitTime());
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id
+    `, [(req as any).user.id, brand_id, branch_id, customer_name, customer_phone, order_id, platform, call_center_message, case_type || 'Late Order', technical_type, isoDedicationTime, getCurrentKuwaitTime()]);
     
-    const requestId = result.lastInsertRowid;
+    const requestId = result.rows[0].id;
 
     if (dynamic_values && typeof dynamic_values === 'object') {
-      const insertValue = db.prepare("INSERT INTO late_order_field_values (request_id, field_id, value) VALUES (?, ?, ?)");
       for (const [fieldId, value] of Object.entries(dynamic_values)) {
         if (value !== undefined && value !== null) {
-          insertValue.run(requestId, fieldId, value.toString());
+          await db.query("INSERT INTO late_order_field_values (request_id, field_id, value) VALUES ($1, $2, $3)", [requestId, fieldId, value.toString()]);
         }
       }
     }
@@ -1339,9 +1548,9 @@ async function startServer() {
     res.json({ id: requestId });
   });
 
-  app.get("/api/late-orders", authenticate, (req, res) => {
+  app.get("/api/late-orders", authenticate, async (req, res) => {
     const user = (req as any).user;
-    const restriction = getBrandRestriction(user);
+    const restriction = await getBrandRestriction(user);
     
     let query = `
       SELECT lo.*, u.username as call_center_name, r.name as creator_role, b.name as brand_name, br.name as branch_name
@@ -1355,21 +1564,21 @@ async function startServer() {
 
     if (user.role_name === 'Call Center') {
       if (restriction) {
-        const placeholders = restriction.brands.map(() => '?').join(',');
+        const placeholders = restriction.brands.map((_: any, i: number) => `$${i + 1}`).join(',');
         query += ` WHERE (b.name ${restriction.type === 'include' ? 'IN' : 'NOT IN'} (${placeholders}))`;
         params.push(...restriction.brands);
       } else {
-        query += " WHERE (lo.call_center_user_id = ? OR r.name = 'Restaurants')";
+        query += " WHERE (lo.call_center_user_id = $1 OR r.name = 'Restaurants')";
         params.push(user.id);
       }
       query += " AND lo.case_type != 'Technical'";
     } else if (user.role_name === 'Restaurants') {
       const conditions = [];
       if (user.branch_id) {
-        conditions.push("lo.branch_id = ?");
+        conditions.push("lo.branch_id = $1");
         params.push(user.branch_id);
       } else if (restriction) {
-        const placeholders = restriction.brands.map(() => '?').join(',');
+        const placeholders = restriction.brands.map((_: any, i: number) => `$${i + 1}`).join(',');
         conditions.push(`b.name ${restriction.type === 'include' ? 'IN' : 'NOT IN'} (${placeholders})`);
         params.push(...restriction.brands);
       } else {
@@ -1382,30 +1591,30 @@ async function startServer() {
     } else if (user.role_name === 'Technical Back Office') {
       query += " WHERE lo.case_type = 'Technical'";
       if (restriction) {
-        const placeholders = restriction.brands.map(() => '?').join(',');
+        const placeholders = restriction.brands.map((_: any, i: number) => `$${i + 1}`).join(',');
         query += ` AND b.name ${restriction.type === 'include' ? 'IN' : 'NOT IN'} (${placeholders})`;
         params.push(...restriction.brands);
       }
     } else if (user.role_name === 'Manager' || user.role_name === 'Marketing Team' || user.role_name === 'Super Visor') {
       if (restriction) {
-        const placeholders = restriction.brands.map(() => '?').join(',');
+        const placeholders = restriction.brands.map((_: any, i: number) => `$${i + 1}`).join(',');
         query += ` WHERE b.name ${restriction.type === 'include' ? 'IN' : 'NOT IN'} (${placeholders})`;
         params.push(...restriction.brands);
       }
     }
 
     query += " ORDER BY lo.created_at DESC";
-    const requests = db.prepare(query).all(...params) as any[];
+    const requests = await db.all(query, params) as any[];
 
     if (requests.length > 0) {
       const requestIds = requests.map(r => r.id);
-      const placeholders = requestIds.map(() => '?').join(',');
-      const fieldValues = db.prepare(`
+      const placeholders = requestIds.map((_: any, i: number) => `$${i + 1}`).join(',');
+      const fieldValues = await db.all(`
         SELECT fv.*, f.name_en, f.name_ar, f.type
         FROM late_order_field_values fv
         JOIN call_center_form_fields f ON fv.field_id = f.id
         WHERE fv.request_id IN (${placeholders})
-      `).all(...requestIds) as any[];
+      `, requestIds) as any[];
 
       requests.forEach(r => {
         r.dynamic_values = fieldValues.filter(fv => fv.request_id === r.id);
@@ -1415,12 +1624,12 @@ async function startServer() {
     res.json(requests);
   });
 
-  app.put("/api/late-orders/:id", authenticate, authorize(["Restaurants", "Manager", "Super Visor", "Call Center", "Technical Back Office"]), (req, res) => {
+  app.put("/api/late-orders/:id", authenticate, authorize(["Restaurants", "Manager", "Super Visor", "Call Center", "Technical Back Office"]), async (req, res) => {
     const { id } = req.params;
     const { status, restaurant_message } = req.body;
     const user = (req as any).user;
     
-    let query = "UPDATE late_order_requests SET status = ?, restaurant_message = ?, updated_at = CURRENT_TIMESTAMP";
+    let query = "UPDATE late_order_requests SET status = $1, restaurant_message = $2, updated_at = CURRENT_TIMESTAMP";
     const params: any[] = [status, restaurant_message];
 
     if (user.role_name === 'Restaurants') {
@@ -1431,23 +1640,23 @@ async function startServer() {
       query += ", manager_responded_at = CURRENT_TIMESTAMP"; // Reuse manager_responded_at for simplicity or add a new column
     }
 
-    query += " WHERE id = ?";
+    query += " WHERE id = $" + (params.length + 1);
     params.push(id);
 
-    db.prepare(query).run(...params);
+    await db.query(query, params);
     
     broadcast({ type: "LATE_ORDER_UPDATED", id });
     res.json({ success: true });
   });
 
   // Call Center Form Configuration
-  app.get("/api/call-center/config", authenticate, (req, res) => {
-    const fields = db.prepare("SELECT * FROM call_center_form_fields WHERE is_active = 1 ORDER BY display_order").all();
-    const options = db.prepare("SELECT * FROM call_center_field_options ORDER BY display_order").all();
-    const technicalTypes = db.prepare("SELECT * FROM technical_case_types WHERE is_active = 1").all();
-    const platforms = db.prepare("SELECT * FROM call_center_platforms WHERE is_active = 1").all();
-    const caseTypes = db.prepare("SELECT * FROM call_center_case_types WHERE is_active = 1").all();
-    const brands = db.prepare("SELECT id, name FROM brands").all();
+  app.get("/api/call-center/config", authenticate, async (req, res) => {
+    const fields = await db.all("SELECT * FROM call_center_form_fields WHERE is_active = 1 ORDER BY display_order");
+    const options = await db.all("SELECT * FROM call_center_field_options ORDER BY display_order");
+    const technicalTypes = await db.all("SELECT * FROM technical_case_types WHERE is_active = 1");
+    const platforms = await db.all("SELECT * FROM call_center_platforms WHERE is_active = 1");
+    const caseTypes = await db.all("SELECT * FROM call_center_case_types WHERE is_active = 1");
+    const brands = await db.all("SELECT id, name FROM brands");
 
     res.json({
       fields,
@@ -1459,124 +1668,124 @@ async function startServer() {
     });
   });
 
-  app.post("/api/call-center/platforms", authenticate, authorize(["Manager"]), (req, res) => {
+  app.post("/api/call-center/platforms", authenticate, authorize(["Manager"]), async (req, res) => {
     const { name_en, name_ar } = req.body;
-    const result = db.prepare("INSERT INTO call_center_platforms (name_en, name_ar) VALUES (?, ?)").run(name_en, name_ar);
-    res.json({ id: result.lastInsertRowid });
+    const result = await db.query("INSERT INTO call_center_platforms (name_en, name_ar) VALUES ($1, $2) RETURNING id", [name_en, name_ar]);
+    res.json({ id: result.rows[0].id });
   });
 
-  app.delete("/api/call-center/platforms/:id", authenticate, authorize(["Manager"]), (req, res) => {
-    db.prepare("DELETE FROM call_center_platforms WHERE id = ?").run(req.params.id);
+  app.delete("/api/call-center/platforms/:id", authenticate, authorize(["Manager"]), async (req, res) => {
+    await db.query("DELETE FROM call_center_platforms WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
-  app.post("/api/call-center/case-types", authenticate, authorize(["Manager"]), (req, res) => {
+  app.post("/api/call-center/case-types", authenticate, authorize(["Manager"]), async (req, res) => {
     const { name_en, name_ar } = req.body;
-    const result = db.prepare("INSERT INTO call_center_case_types (name_en, name_ar) VALUES (?, ?)").run(name_en, name_ar);
-    res.json({ id: result.lastInsertRowid });
+    const result = await db.query("INSERT INTO call_center_case_types (name_en, name_ar) VALUES ($1, $2) RETURNING id", [name_en, name_ar]);
+    res.json({ id: result.rows[0].id });
   });
 
-  app.delete("/api/call-center/case-types/:id", authenticate, authorize(["Manager"]), (req, res) => {
-    db.prepare("DELETE FROM call_center_case_types WHERE id = ?").run(req.params.id);
+  app.delete("/api/call-center/case-types/:id", authenticate, authorize(["Manager"]), async (req, res) => {
+    await db.query("DELETE FROM call_center_case_types WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
-  app.get("/api/call-center/fields", authenticate, (req, res) => {
+  app.get("/api/call-center/fields", authenticate, async (req, res) => {
     try {
-      const fields = db.prepare("SELECT * FROM call_center_form_fields ORDER BY display_order ASC").all();
-      const options = db.prepare("SELECT * FROM call_center_field_options ORDER BY display_order ASC").all();
-      const technicalTypes = db.prepare("SELECT * FROM technical_case_types WHERE is_active = 1 ORDER BY created_at DESC").all();
+      const fields = await db.all("SELECT * FROM call_center_form_fields ORDER BY display_order ASC");
+      const options = await db.all("SELECT * FROM call_center_field_options ORDER BY display_order ASC");
+      const technicalTypes = await db.all("SELECT * FROM technical_case_types WHERE is_active = 1 ORDER BY created_at DESC");
       res.json({ fields, options, technicalTypes });
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch call center fields" });
     }
   });
 
-  app.post("/api/call-center/technical-types", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/call-center/technical-types", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { name_en, name_ar } = req.body;
     try {
-      const result = db.prepare("INSERT INTO technical_case_types (name_en, name_ar) VALUES (?, ?)").run(name_en, name_ar);
-      res.json({ id: result.lastInsertRowid });
+      const result = await db.query("INSERT INTO technical_case_types (name_en, name_ar) VALUES ($1, $2) RETURNING id", [name_en, name_ar]);
+      res.json({ id: result.rows[0].id });
     } catch (error) {
       res.status(500).json({ error: "Failed to add technical type" });
     }
   });
 
-  app.delete("/api/call-center/technical-types/:id", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.delete("/api/call-center/technical-types/:id", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     try {
-      db.prepare("DELETE FROM technical_case_types WHERE id = ?").run(req.params.id);
+      await db.query("DELETE FROM technical_case_types WHERE id = $1", [req.params.id]);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to delete technical type" });
     }
   });
 
-  app.post("/api/call-center/fields", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/call-center/fields", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { name_en, name_ar, type, is_required, display_order } = req.body;
     try {
-      const result = db.prepare(`
+      const result = await db.query(`
         INSERT INTO call_center_form_fields (name_en, name_ar, type, is_required, display_order)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(name_en, name_ar, type, is_required || 0, display_order || 0);
-      res.json({ id: result.lastInsertRowid });
+        VALUES ($1, $2, $3, $4, $5) RETURNING id
+      `, [name_en, name_ar, type, is_required || 0, display_order || 0]);
+      res.json({ id: result.rows[0].id });
     } catch (error) {
       res.status(500).json({ error: "Failed to create field" });
     }
   });
 
-  app.put("/api/call-center/fields/:id", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.put("/api/call-center/fields/:id", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { name_en, name_ar, type, is_required, display_order, is_active } = req.body;
     try {
-      db.prepare(`
+      await db.query(`
         UPDATE call_center_form_fields
-        SET name_en = ?, name_ar = ?, type = ?, is_required = ?, display_order = ?, is_active = ?
-        WHERE id = ?
-      `).run(name_en, name_ar, type, is_required, display_order, is_active, req.params.id);
+        SET name_en = $1, name_ar = $2, type = $3, is_required = $4, display_order = $5, is_active = $6
+        WHERE id = $7
+      `, [name_en, name_ar, type, is_required, display_order, is_active, req.params.id]);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to update field" });
     }
   });
 
-  app.delete("/api/call-center/fields/:id", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.delete("/api/call-center/fields/:id", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     try {
-      db.prepare("DELETE FROM call_center_form_fields WHERE id = ?").run(req.params.id);
+      await db.query("DELETE FROM call_center_form_fields WHERE id = $1", [req.params.id]);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to delete field" });
     }
   });
 
-  app.post("/api/call-center/fields/:id/options", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/call-center/fields/:id/options", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { value_en, value_ar, display_order } = req.body;
     try {
-      const result = db.prepare(`
+      const result = await db.query(`
         INSERT INTO call_center_field_options (field_id, value_en, value_ar, display_order)
-        VALUES (?, ?, ?, ?)
-      `).run(req.params.id, value_en, value_ar, display_order || 0);
-      res.json({ id: result.lastInsertRowid });
+        VALUES ($1, $2, $3, $4) RETURNING id
+      `, [req.params.id, value_en, value_ar, display_order || 0]);
+      res.json({ id: result.rows[0].id });
     } catch (error) {
       res.status(500).json({ error: "Failed to add option" });
     }
   });
 
-  app.delete("/api/call-center/fields/options/:id", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.delete("/api/call-center/fields/options/:id", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     try {
-      db.prepare("DELETE FROM call_center_field_options WHERE id = ?").run(req.params.id);
+      await db.query("DELETE FROM call_center_field_options WHERE id = $1", [req.params.id]);
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to delete option" });
     }
   });
 
-  app.post("/api/late-orders/:id/view", authenticate, authorize(["Restaurants", "Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/late-orders/:id/view", authenticate, authorize(["Restaurants", "Manager", "Super Visor"]), async (req, res) => {
     const { id } = req.params;
     const user = (req as any).user;
     
     if (user.role_name === 'Restaurants') {
-      db.prepare("UPDATE late_order_requests SET restaurant_viewed_at = CURRENT_TIMESTAMP WHERE id = ? AND restaurant_viewed_at IS NULL").run(id);
+      await db.query("UPDATE late_order_requests SET restaurant_viewed_at = CURRENT_TIMESTAMP WHERE id = $1 AND restaurant_viewed_at IS NULL", [id]);
     } else if (user.role_name === 'Manager') {
-      db.prepare("UPDATE late_order_requests SET manager_viewed_at = CURRENT_TIMESTAMP WHERE id = ? AND manager_viewed_at IS NULL").run(id);
+      await db.query("UPDATE late_order_requests SET manager_viewed_at = CURRENT_TIMESTAMP WHERE id = $1 AND manager_viewed_at IS NULL", [id]);
     }
     
     broadcast({ type: "LATE_ORDER_UPDATED", id });
@@ -1588,7 +1797,7 @@ async function startServer() {
     const { username, password } = req.body;
     console.log(`[LOGIN] Attempt for user: ${username}`);
     try {
-      const user = db.prepare("SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = ? AND u.is_active = 1").get(username) as any;
+      const user = await db.get("SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = $1 AND u.is_active = 1", [username]) as any;
       
       if (!user) {
         console.log(`[LOGIN] User not found: ${username}`);
@@ -1604,7 +1813,7 @@ async function startServer() {
       }
 
       console.log(`[LOGIN] Success for: ${username}`);
-      const userBrands = db.prepare("SELECT brand_id FROM user_brands WHERE user_id = ?").all(user.id) as any[];
+      const userBrands = await db.all("SELECT brand_id FROM user_brands WHERE user_id = $1", [user.id]) as any[];
       const brandIds = userBrands.map(ub => ub.brand_id);
       
       const userData = { 
@@ -1625,72 +1834,70 @@ async function startServer() {
   });
 
   // Brands Routes
-  app.get("/api/brands", authenticate, (req, res) => {
+  app.get("/api/brands", authenticate, async (req, res) => {
     const { all } = req.query;
-    const restriction = all === 'true' ? null : getBrandRestriction((req as any).user);
+    const restriction = all === 'true' ? null : await getBrandRestriction((req as any).user);
     let brands;
     if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_: any, i: number) => `$${i + 1}`).join(',');
       if (restriction.type === 'include') {
-        brands = db.prepare(`SELECT * FROM brands WHERE name IN (${placeholders}) ORDER BY name ASC`).all(...restriction.brands);
+        brands = await db.all(`SELECT * FROM brands WHERE name IN (${placeholders}) ORDER BY name ASC`, restriction.brands);
       } else {
-        brands = db.prepare(`SELECT * FROM brands WHERE name NOT IN (${placeholders}) ORDER BY name ASC`).all(...restriction.brands);
+        brands = await db.all(`SELECT * FROM brands WHERE name NOT IN (${placeholders}) ORDER BY name ASC`, restriction.brands);
       }
     } else {
-      brands = db.prepare("SELECT * FROM brands ORDER BY name ASC").all();
+      brands = await db.all("SELECT * FROM brands ORDER BY name ASC");
     }
     res.json(brands);
   });
 
-  app.post("/api/brands", authenticate, authorize(["Technical Back Office", "Manager"]), (req, res) => {
+  app.post("/api/brands", authenticate, authorize(["Technical Back Office", "Manager"]), async (req, res) => {
     const { name } = req.body;
     try {
-      const result = db.prepare("INSERT INTO brands (name) VALUES (?)").run(name);
-      logAction((req as any).user.id, "CREATE", "brands", Number(result.lastInsertRowid), null, { name });
-      res.json({ id: result.lastInsertRowid, name });
+      const result = await db.query("INSERT INTO brands (name) VALUES ($1) RETURNING id", [name]);
+      const brandId = Number(result.rows[0].id);
+      await logAction((req as any).user.id, "CREATE", "brands", brandId, null, { name });
+      res.json({ id: brandId, name });
     } catch (e) {
       res.status(400).json({ error: "Brand already exists" });
     }
   });
 
-  app.delete("/api/brands/:id", authenticate, authorize(["Technical Back Office", "Manager"]), (req, res) => {
-    db.prepare("DELETE FROM brands WHERE id = ?").run(req.params.id);
+  app.delete("/api/brands/:id", authenticate, authorize(["Technical Back Office", "Manager"]), async (req, res) => {
+    await db.query("DELETE FROM brands WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
   // Dynamic Fields Routes
-  app.get("/api/fields", authenticate, (req, res) => {
-    const fields = db.prepare("SELECT * FROM dynamic_fields ORDER BY field_order ASC").all();
-    const options = db.prepare("SELECT * FROM field_options").all();
+  app.get("/api/fields", authenticate, async (req, res) => {
+    const fields = await db.all("SELECT * FROM dynamic_fields ORDER BY field_order ASC");
+    const options = await db.all("SELECT * FROM field_options");
     res.json({ fields, options });
   });
 
-  app.post("/api/fields", authenticate, authorize(["Manager"]), (req, res) => {
+  app.post("/api/fields", authenticate, authorize(["Manager"]), async (req, res) => {
     const { name_en, name_ar, type, is_mandatory } = req.body;
-    const result = db.prepare("INSERT INTO dynamic_fields (name_en, name_ar, type, is_mandatory) VALUES (?, ?, ?, ?)").run(name_en, name_ar, type, is_mandatory ? 1 : 0);
-    res.json({ id: result.lastInsertRowid });
+    const result = await db.query("INSERT INTO dynamic_fields (name_en, name_ar, type, is_mandatory) VALUES ($1, $2, $3, $4) RETURNING id", [name_en, name_ar, type, is_mandatory ? 1 : 0]);
+    res.json({ id: result.rows[0].id });
   });
 
-  app.put("/api/fields/:id", authenticate, authorize(["Manager"]), (req, res) => {
+  app.put("/api/fields/:id", authenticate, authorize(["Manager"]), async (req, res) => {
     const { name_en, name_ar, type, is_mandatory } = req.body;
-    db.prepare("UPDATE dynamic_fields SET name_en = ?, name_ar = ?, type = ?, is_mandatory = ? WHERE id = ?")
-      .run(name_en, name_ar, type, is_mandatory ? 1 : 0, req.params.id);
+    await db.query("UPDATE dynamic_fields SET name_en = $1, name_ar = $2, type = $3, is_mandatory = $4 WHERE id = $5", [name_en, name_ar, type, is_mandatory ? 1 : 0, req.params.id]);
     res.json({ success: true });
   });
 
-  app.delete("/api/fields/options/:id", authenticate, authorize(["Manager"]), (req, res) => {
-    db.prepare("DELETE FROM field_options WHERE id = ?").run(req.params.id);
+  app.delete("/api/fields/options/:id", authenticate, authorize(["Manager"]), async (req, res) => {
+    await db.query("DELETE FROM field_options WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
-  app.delete("/api/fields/:id", authenticate, authorize(["Manager"]), (req, res) => {
+  app.delete("/api/fields/:id", authenticate, authorize(["Manager"]), async (req, res) => {
     const fieldId = req.params.id;
     try {
-      // With PRAGMA foreign_keys = ON and ON DELETE CASCADE, deleting from dynamic_fields
-      // will automatically delete from field_options and product_field_values.
-      const result = db.prepare("DELETE FROM dynamic_fields WHERE id = ?").run(fieldId);
+      const result = await db.query("DELETE FROM dynamic_fields WHERE id = $1", [fieldId]);
       
-      if (result.changes === 0) {
+      if (result.rowCount === 0) {
         return res.status(404).json({ error: "Field not found" });
       }
 
@@ -1702,18 +1909,17 @@ async function startServer() {
     }
   });
 
-  app.post("/api/fields/:id/options", authenticate, authorize(["Manager"]), (req, res) => {
+  app.post("/api/fields/:id/options", authenticate, authorize(["Manager"]), async (req, res) => {
     const { value_en, value_ar, price } = req.body;
     const fieldId = req.params.id;
-    const result = db.prepare("INSERT INTO field_options (field_id, value_en, value_ar, price) VALUES (?, ?, ?, ?)")
-      .run(fieldId, value_en, value_ar, price || 0);
-    res.json({ id: result.lastInsertRowid });
+    const result = await db.query("INSERT INTO field_options (field_id, value_en, value_ar, price) VALUES ($1, $2, $3, $4) RETURNING id", [fieldId, value_en, value_ar, price || 0]);
+    res.json({ id: result.rows[0].id });
   });
 
   // Products Routes
-  app.get("/api/products", authenticate, (req, res) => {
+  app.get("/api/products", authenticate, async (req, res) => {
     const { brand_id, all } = req.query;
-    const restriction = all === 'true' ? null : getBrandRestriction((req as any).user);
+    const restriction = all === 'true' ? null : await getBrandRestriction((req as any).user);
     
     let query = `
       SELECT p.*, b.name as brand_name, pc.code as product_code, u.username as creator_name
@@ -1726,15 +1932,15 @@ async function startServer() {
     const conditions: string[] = [];
 
     if (brand_id) {
-      conditions.push("p.brand_id = ?");
+      conditions.push("p.brand_id = $1");
       params.push(brand_id);
     }
 
-    const allProductsDebug = db.prepare("SELECT p.id, b.name as brand_name FROM products p LEFT JOIN brands b ON p.brand_id = b.id").all();
+    const allProductsDebug = await db.all("SELECT p.id, b.name as brand_name FROM products p LEFT JOIN brands b ON p.brand_id = b.id");
     console.log("DEBUG: All Products in DB:", allProductsDebug);
 
     if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_: any, i: number) => `$${params.length + i + 1}`).join(',');
       if (restriction.type === 'include') {
         conditions.push(`b.name IN (${placeholders})`);
       } else {
@@ -1749,29 +1955,28 @@ async function startServer() {
 
     query += " ORDER BY p.created_at DESC";
     
-    const products = db.prepare(query).all(...params) as any[];
+    const products = await db.all(query, params) as any[];
     const productIds = products.map(p => p.id);
     
     if (productIds.length === 0) {
       return res.json({ products: [], fieldValues: [] });
     }
 
-    const productNameField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Product Name (EN)'").get() as { id: number } | undefined;
-    const productNameFieldId = productNameField?.id || 3;
+    const productNameFieldId = await getProductNameFieldId();
     
-    const placeholders = productIds.map(() => '?').join(',');
+    const placeholders = productIds.map((_: any, i: number) => `$${i + 1}`).join(',');
     
-    const fieldValues = db.prepare(`SELECT * FROM product_field_values WHERE product_id IN (${placeholders}) AND field_id = ?`).all(...productIds, productNameFieldId);
-    const modifierGroups = db.prepare(`SELECT * FROM modifier_groups WHERE product_id IN (${placeholders})`).all(...productIds);
+    const fieldValues = await db.all(`SELECT * FROM product_field_values WHERE product_id IN (${placeholders})`, productIds);
+    const modifierGroups = await db.all(`SELECT * FROM modifier_groups WHERE product_id IN (${placeholders})`, productIds);
     const groupIds = modifierGroups.map((mg: any) => mg.id);
     
     let modifierOptions: any[] = [];
     if (groupIds.length > 0) {
-      const groupPlaceholders = groupIds.map(() => '?').join(',');
-      modifierOptions = db.prepare(`SELECT * FROM modifier_options WHERE group_id IN (${groupPlaceholders})`).all(...groupIds);
+      const groupPlaceholders = groupIds.map((_: any, i: number) => `$${i + 1}`).join(',');
+      modifierOptions = await db.all(`SELECT * FROM modifier_options WHERE group_id IN (${groupPlaceholders})`, groupIds);
     }
 
-    const productChannels = db.prepare(`SELECT * FROM product_channels WHERE product_id IN (${placeholders})`).all(...productIds);
+    const productChannels = await db.all(`SELECT * FROM product_channels WHERE product_id IN (${placeholders})`, productIds);
     
     // Efficiently map related data to products
     const filteredProducts = products.map((p: any) => {
@@ -1796,15 +2001,15 @@ async function startServer() {
     res.json({ products: filteredProducts, fieldValues });
   });
 
-  app.post("/api/products/:id/toggle-offline", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/products/:id/toggle-offline", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { id } = req.params;
-    const product = db.prepare("SELECT is_offline FROM products WHERE id = ?").get(id) as any;
+    const product = await db.get("SELECT is_offline FROM products WHERE id = $1", [id]) as any;
     if (!product) return res.status(404).json({ error: "Product not found" });
 
     const newStatus = product.is_offline ? 0 : 1;
-    db.prepare("UPDATE products SET is_offline = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(newStatus, id);
+    await db.query("UPDATE products SET is_offline = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [newStatus, id]);
     
-    logAction((req as any).user.id, "UPDATE", "products", Number(id), null, { is_offline: newStatus });
+    await logAction((req as any).user.id, "UPDATE", "products", Number(id), null, { is_offline: newStatus });
     
     // Broadcast update
     wss.clients.forEach(client => {
@@ -1816,13 +2021,13 @@ async function startServer() {
     res.json({ success: true, is_offline: newStatus });
   });
 
-  app.post("/api/products", authenticate, authorize(["Marketing Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/products", authenticate, authorize(["Marketing Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
     const { brand_id, fieldValues, modifierGroups, channels } = req.body;
     
     // Brand Restriction Check
-    const restriction = getBrandRestriction((req as any).user);
+    const restriction = await getBrandRestriction((req as any).user);
     if (restriction) {
-      const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(brand_id) as { name: string };
+      const brand = await db.get("SELECT name FROM brands WHERE id = $1", [brand_id]) as { name: string };
       if (restriction.type === 'include') {
         if (!restriction.brands.includes(brand.name)) {
           return res.status(403).json({ error: "You are not authorized to add products for this brand" });
@@ -1834,208 +2039,208 @@ async function startServer() {
       }
     }
 
-    const insertProduct = db.prepare("INSERT INTO products (brand_id, created_by) VALUES (?, ?)");
-    const insertValue = db.prepare("INSERT INTO product_field_values (product_id, field_id, value) VALUES (?, ?, ?)");
-    const insertGroup = db.prepare("INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection, code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-    const insertOption = db.prepare("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment, code) VALUES (?, ?, ?, ?, ?)");
-    const insertChannel = db.prepare("INSERT INTO product_channels (product_id, channel_name) VALUES (?, ?)");
-    
-    const transaction = db.transaction((data) => {
-      const result = insertProduct.run(data.brand_id, (req as any).user.id);
-      const productId = result.lastInsertRowid;
-      
-      // Save dynamic field values
-      for (const [fieldId, value] of Object.entries(data.fieldValues)) {
-        insertValue.run(productId, fieldId, typeof value === 'object' ? JSON.stringify(value) : String(value));
-      }
-
-      // Save modifier groups
-      if (data.modifierGroups && Array.isArray(data.modifierGroups)) {
-        for (const group of data.modifierGroups) {
-          const groupResult = insertGroup.run(
-            productId,
-            group.name_en,
-            group.name_ar,
-            group.selection_type || 'single',
-            group.is_required ? 1 : 0,
-            group.min_selection || 0,
-            group.max_selection || 1,
-            group.code || null
-          );
-          const groupId = groupResult.lastInsertRowid;
-
-          if (group.options && Array.isArray(group.options)) {
-            for (const option of group.options) {
-              insertOption.run(groupId, option.name_en, option.name_ar, option.price_adjustment || 0, option.code || null);
-            }
-          }
-        }
-      }
-
-      // Save channels
-      if (data.channels && Array.isArray(data.channels)) {
-        for (const channel of data.channels) {
-          insertChannel.run(productId, channel);
-        }
-      }
-      
-      return productId;
-    });
-
-    const productId = transaction({ brand_id, fieldValues, modifierGroups, channels });
-    const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(brand_id) as { name: string };
-    const productNameFieldId = getProductNameFieldId();
-    const productName = fieldValues[productNameFieldId.toString()] || "Unknown Product";
-    logAction((req as any).user.id, "CREATE", "products", Number(productId), null, { 
-      product_name: productName, 
-      brand_name: brand?.name || 'Unknown Brand',
-      brand_id, 
-      fieldValues, 
-      modifierGroups, 
-      channels 
-    });
-    broadcast({ type: "PRODUCT_CREATED", productId });
-    res.json({ id: productId });
-  });
-
-  app.put("/api/products/:id", authenticate, authorize(["Marketing Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor", "Restaurants"]), (req, res) => {
-    const { fieldValues, modifierGroups, channels } = req.body;
-    const productId = req.params.id;
-
-    // Brand Restriction Check
-    const restriction = getBrandRestriction((req as any).user);
-    if (restriction) {
-      const product = db.prepare("SELECT brand_id FROM products WHERE id = ?").get(productId) as { brand_id: number };
-      const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(product.brand_id) as { name: string };
-      if (restriction.type === 'include') {
-        if (!restriction.brands.includes(brand.name)) {
-          return res.status(403).json({ error: "You are not authorized to edit products for this brand" });
-        }
-      } else {
-        if (restriction.brands.includes(brand.name)) {
-          return res.status(403).json({ error: "You are not authorized to edit products for this brand" });
-        }
-      }
-    }
-    
-    const deleteValues = db.prepare("DELETE FROM product_field_values WHERE product_id = ?");
-    const insertValue = db.prepare("INSERT INTO product_field_values (product_id, field_id, value) VALUES (?, ?, ?)");
-    const deleteGroups = db.prepare("DELETE FROM modifier_groups WHERE product_id = ?");
-    const insertGroup = db.prepare("INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection, code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
-    const insertOption = db.prepare("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment, code) VALUES (?, ?, ?, ?, ?)");
-    const deleteChannels = db.prepare("DELETE FROM product_channels WHERE product_id = ?");
-    const insertChannel = db.prepare("INSERT INTO product_channels (product_id, channel_name) VALUES (?, ?)");
-    const updateProduct = db.prepare("UPDATE products SET updated_at = CURRENT_TIMESTAMP WHERE id = ?");
-
-    const transaction = db.transaction((data) => {
-      if ((req as any).user.role_name === 'Restaurants') {
-        // Restricted update for Restaurants: Only Ingredients
-        const ingredientsField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Ingredients'").get() as { id: number } | undefined;
-        if (ingredientsField && data.fieldValues[ingredientsField.id] !== undefined) {
-          const exists = db.prepare("SELECT id FROM product_field_values WHERE product_id = ? AND field_id = ?").get(productId, ingredientsField.id) as { id: number } | undefined;
-          if (exists) {
-            db.prepare("UPDATE product_field_values SET value = ? WHERE id = ?").run(data.fieldValues[ingredientsField.id], exists.id);
-          } else {
-            db.prepare("INSERT INTO product_field_values (product_id, field_id, value) VALUES (?, ?, ?)").run(productId, ingredientsField.id, data.fieldValues[ingredientsField.id]);
-          }
-        }
-      } else {
-        // Full update for other roles
-        deleteValues.run(productId);
-        for (const [fieldId, value] of Object.entries(data.fieldValues)) {
-          insertValue.run(productId, fieldId, typeof value === 'object' ? JSON.stringify(value) : String(value));
+    try {
+      const productId = await db.transaction(async (client) => {
+        const productResult = await client.query("INSERT INTO products (brand_id, created_by) VALUES ($1, $2) RETURNING id", [brand_id, (req as any).user.id]);
+        const productId = productResult.rows[0].id;
+        
+        // Save dynamic field values
+        for (const [fieldId, value] of Object.entries(fieldValues)) {
+          await client.query("INSERT INTO product_field_values (product_id, field_id, value) VALUES ($1, $2, $3)", [productId, fieldId, typeof value === 'object' ? JSON.stringify(value) : String(value)]);
         }
 
-        deleteGroups.run(productId);
-        if (data.modifierGroups && Array.isArray(data.modifierGroups)) {
-          for (const group of data.modifierGroups) {
-            const groupResult = insertGroup.run(
-              productId,
-              group.name_en,
-              group.name_ar,
-              group.selection_type || 'single',
-              group.is_required ? 1 : 0,
-              group.min_selection || 0,
-              group.max_selection || 1,
-              group.code || null
+        // Save modifier groups
+        if (modifierGroups && Array.isArray(modifierGroups)) {
+          for (const group of modifierGroups) {
+            const groupResult = await client.query(
+              "INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection, code) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+              [
+                productId,
+                group.name_en,
+                group.name_ar,
+                group.selection_type || 'single',
+                group.is_required ? 1 : 0,
+                group.min_selection || 0,
+                group.max_selection || 1,
+                group.code || null
+              ]
             );
-            const groupId = groupResult.lastInsertRowid;
+            const groupId = groupResult.rows[0].id;
 
             if (group.options && Array.isArray(group.options)) {
               for (const option of group.options) {
-                insertOption.run(groupId, option.name_en, option.name_ar, option.price_adjustment || 0, option.code || null);
+                await client.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment, code) VALUES ($1, $2, $3, $4, $5)", [groupId, option.name_en, option.name_ar, option.price_adjustment || 0, option.code || null]);
               }
             }
           }
         }
 
-        deleteChannels.run(productId);
-        if (data.channels && Array.isArray(data.channels)) {
-          for (const channel of data.channels) {
-            insertChannel.run(productId, channel);
+        // Save channels
+        if (channels && Array.isArray(channels)) {
+          for (const channel of channels) {
+            await client.query("INSERT INTO product_channels (product_id, channel_name) VALUES ($1, $2)", [productId, channel]);
           }
         }
-      }
+        
+        return productId;
+      });
 
-      updateProduct.run(productId);
-    });
-
-    transaction({ fieldValues, modifierGroups, channels });
-    const product = db.prepare("SELECT brand_id FROM products WHERE id = ?").get(productId) as { brand_id: number };
-    const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(product.brand_id) as { name: string };
-    const productNameFieldId = getProductNameFieldId();
-    const productName = fieldValues[productNameFieldId.toString()] || "Unknown Product";
-    logAction((req as any).user.id, "UPDATE", "products", Number(productId), null, { 
-      product_name: productName, 
-      brand_name: brand?.name || 'Unknown Brand',
-      fieldValues, 
-      modifierGroups, 
-      channels 
-    });
-    broadcast({ type: "PRODUCT_UPDATED", productId });
-    res.json({ success: true });
+      const brand = await db.get("SELECT name FROM brands WHERE id = $1", [brand_id]) as { name: string };
+      const productNameFieldId = await getProductNameFieldId();
+      const productName = fieldValues[productNameFieldId.toString()] || "Unknown Product";
+      await logAction((req as any).user.id, "CREATE", "products", Number(productId), null, { 
+        product_name: productName, 
+        brand_name: brand?.name || 'Unknown Brand',
+        brand_id, 
+        fieldValues, 
+        modifierGroups, 
+        channels 
+      });
+      broadcast({ type: "PRODUCT_CREATED", productId });
+      res.json({ id: productId });
+    } catch (error) {
+      console.error("Create product error:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
-  app.delete("/api/products/:id", authenticate, authorize(["Marketing Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
-    db.prepare("DELETE FROM products WHERE id = ?").run(req.params.id);
-    db.prepare("DELETE FROM product_field_values WHERE product_id = ?").run(req.params.id);
+  app.put("/api/products/:id", authenticate, authorize(["Marketing Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor", "Restaurants"]), async (req, res) => {
+    const { fieldValues, modifierGroups, channels } = req.body;
+    const productId = req.params.id;
+
+    // Brand Restriction Check
+    const restriction = await getBrandRestriction((req as any).user);
+    if (restriction) {
+      const product = await db.get("SELECT brand_id FROM products WHERE id = $1", [productId]) as { brand_id: number };
+      const brand = await db.get("SELECT name FROM brands WHERE id = $1", [product.brand_id]) as { name: string };
+      if (restriction.type === 'include') {
+        if (!restriction.brands.includes(brand.name)) {
+          return res.status(403).json({ error: "You are not authorized to edit products for this brand" });
+        }
+      } else {
+        if (restriction.brands.includes(brand.name)) {
+          return res.status(403).json({ error: "You are not authorized to edit products for this brand" });
+        }
+      }
+    }
+    
+    try {
+      await db.transaction(async (client) => {
+        if ((req as any).user.role_name === 'Restaurants') {
+          // Restricted update for Restaurants: Only Ingredients
+          const ingredientsField = await db.get("SELECT id FROM dynamic_fields WHERE name_en = 'Ingredients'") as { id: number } | undefined;
+          if (ingredientsField && fieldValues && fieldValues[ingredientsField.id] !== undefined) {
+            const exists = await db.get("SELECT id FROM product_field_values WHERE product_id = $1 AND field_id = $2", [productId, ingredientsField.id]) as { id: number } | undefined;
+            if (exists) {
+              await client.query("UPDATE product_field_values SET value = $1 WHERE id = $2", [String(fieldValues[ingredientsField.id]), exists.id]);
+            } else {
+              await client.query("INSERT INTO product_field_values (product_id, field_id, value) VALUES ($1, $2, $3)", [productId, ingredientsField.id, String(fieldValues[ingredientsField.id])]);
+            }
+          }
+        } else {
+          // Full update for other roles
+          await client.query("DELETE FROM product_field_values WHERE product_id = $1", [productId]);
+          for (const [fieldId, value] of Object.entries(fieldValues)) {
+            await client.query("INSERT INTO product_field_values (product_id, field_id, value) VALUES ($1, $2, $3)", [productId, fieldId, typeof value === 'object' ? JSON.stringify(value) : String(value)]);
+          }
+
+          await client.query("DELETE FROM modifier_groups WHERE product_id = $1", [productId]);
+          if (modifierGroups && Array.isArray(modifierGroups)) {
+            for (const group of modifierGroups) {
+              const groupResult = await client.query(
+                "INSERT INTO modifier_groups (product_id, name_en, name_ar, selection_type, is_required, min_selection, max_selection, code) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+                [
+                  productId,
+                  group.name_en,
+                  group.name_ar,
+                  group.selection_type || 'single',
+                  group.is_required ? 1 : 0,
+                  group.min_selection || 0,
+                  group.max_selection || 1,
+                  group.code || null
+                ]
+              );
+              const groupId = groupResult.rows[0].id;
+
+              if (group.options && Array.isArray(group.options)) {
+                for (const option of group.options) {
+                  await client.query("INSERT INTO modifier_options (group_id, name_en, name_ar, price_adjustment, code) VALUES ($1, $2, $3, $4, $5)", [groupId, option.name_en, option.name_ar, option.price_adjustment || 0, option.code || null]);
+                }
+              }
+            }
+          }
+
+          await client.query("DELETE FROM product_channels WHERE product_id = $1", [productId]);
+          if (channels && Array.isArray(channels)) {
+            for (const channel of channels) {
+              await client.query("INSERT INTO product_channels (product_id, channel_name) VALUES ($1, $2)", [productId, channel]);
+            }
+          }
+        }
+
+        await client.query("UPDATE products SET updated_at = CURRENT_TIMESTAMP WHERE id = $1", [productId]);
+      });
+
+      const product = await db.get("SELECT brand_id FROM products WHERE id = $1", [productId]) as { brand_id: number };
+      const brand = await db.get("SELECT name FROM brands WHERE id = $1", [product.brand_id]) as { name: string };
+      const productNameFieldId = await getProductNameFieldId();
+      const productName = fieldValues[productNameFieldId.toString()] || "Unknown Product";
+      await logAction((req as any).user.id, "UPDATE", "products", Number(productId), null, { 
+        product_name: productName, 
+        brand_name: brand?.name || 'Unknown Brand',
+        fieldValues, 
+        modifierGroups, 
+        channels 
+      });
+      broadcast({ type: "PRODUCT_UPDATED", productId });
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Update product error:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+
+  app.delete("/api/products/:id", authenticate, authorize(["Marketing Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
+    await db.query("DELETE FROM products WHERE id = $1", [req.params.id]);
+    await db.query("DELETE FROM product_field_values WHERE product_id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
   // Product Codes (Coding Team)
-  app.post("/api/products/:id/code", authenticate, authorize(["Coding Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/products/:id/code", authenticate, authorize(["Coding Team", "Technical Team", "Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
     const { productCode, modifierGroups } = req.body;
     const productId = req.params.id;
     
-    const transaction = db.transaction(() => {
-      // 1. Product Code
-      const existingProductCode = db.prepare("SELECT id FROM product_codes WHERE product_id = ?").get(productId);
-      if (existingProductCode) {
-        db.prepare("UPDATE product_codes SET code = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP WHERE product_id = ?")
-          .run(productCode, (req as any).user.id, productId);
-      } else {
-        db.prepare("INSERT INTO product_codes (product_id, code, updated_by) VALUES (?, ?, ?)")
-          .run(productId, productCode, (req as any).user.id);
-      }
+    try {
+      await db.transaction(async (client) => {
+        // 1. Product Code
+        const existingProductCode = await db.get("SELECT id FROM product_codes WHERE product_id = $1", [productId]);
+        if (existingProductCode) {
+          await client.query("UPDATE product_codes SET code = $1, updated_by = $2, updated_at = CURRENT_TIMESTAMP WHERE product_id = $3", [productCode, (req as any).user.id, productId]);
+        } else {
+          await client.query("INSERT INTO product_codes (product_id, code, updated_by) VALUES ($1, $2, $3)", [productId, productCode, (req as any).user.id]);
+        }
 
-      // 2. Modifier Groups and Options Codes
-      if (modifierGroups && Array.isArray(modifierGroups)) {
-        for (const group of modifierGroups) {
-          db.prepare("UPDATE modifier_groups SET code = ? WHERE id = ?").run(group.code, group.id);
-          if (group.options && Array.isArray(group.options)) {
-            for (const option of group.options) {
-              db.prepare("UPDATE modifier_options SET code = ? WHERE id = ?").run(option.code, option.id);
+        // 2. Modifier Groups and Options Codes
+        if (modifierGroups && Array.isArray(modifierGroups)) {
+          for (const group of modifierGroups) {
+            await client.query("UPDATE modifier_groups SET code = $1 WHERE id = $2", [group.code, group.id]);
+            if (group.options && Array.isArray(group.options)) {
+              for (const option of group.options) {
+                await client.query("UPDATE modifier_options SET code = $1 WHERE id = $2", [option.code, option.id]);
+              }
             }
           }
         }
-      }
-    });
-
-    transaction();
-    
-    broadcast({ type: "CODE_UPDATED", productId });
-    logAction((req as any).user.id, "UPDATE_CODES", "products", Number(productId), null, { productCode, modifierGroups });
-    res.json({ success: true });
+      });
+      
+      broadcast({ type: "CODE_UPDATED", productId });
+      await logAction((req as any).user.id, "UPDATE_CODES", "products", Number(productId), null, { productCode, modifierGroups });
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Update product code error:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
   });
 
   // User Management
@@ -2043,118 +2248,118 @@ async function startServer() {
     db.exec("ALTER TABLE users ADD COLUMN branch_id INTEGER REFERENCES branches(id)");
   } catch (e) {}
 
-  app.get("/api/roles", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
-    const roles = db.prepare("SELECT * FROM roles").all();
+  // User Management
+  app.get("/api/roles", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
+    const roles = await db.all("SELECT * FROM roles");
     res.json(roles);
   });
 
-  app.get("/api/users", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
-    const users = db.prepare(`
+  app.get("/api/users", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
+    const users = await db.all(`
       SELECT u.id, u.username, u.role_id, u.brand_id, u.branch_id, u.is_active, r.name as role_name, b.name as brand_name, br.name as branch_name 
       FROM users u 
       JOIN roles r ON u.role_id = r.id
       LEFT JOIN brands b ON u.brand_id = b.id
       LEFT JOIN branches br ON u.branch_id = br.id
-    `).all() as any[];
+    `) as any[];
 
-    const usersWithBrands = users.map(user => {
-      const brands = db.prepare(`
+    const usersWithBrands = [];
+    for (const user of users) {
+      const brands = await db.all(`
         SELECT b.id, b.name 
         FROM user_brands ub 
         JOIN brands b ON ub.brand_id = b.id 
-        WHERE ub.user_id = ?
-      `).all(user.id) as { id: number, name: string }[];
+        WHERE ub.user_id = $1
+      `, [user.id]) as { id: number, name: string }[];
       
-      return {
+      usersWithBrands.push({
         ...user,
         brand_ids: brands.map(b => b.id),
         brand_names: brands.map(b => b.name)
-      };
-    });
+      });
+    }
 
     res.json(usersWithBrands);
   });
 
-  app.post("/api/users", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/users", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { username, password, role_id, brand_id, branch_id, brand_ids } = req.body;
     const hashedPassword = bcrypt.hashSync(password, 10);
     try {
-      const transaction = db.transaction(() => {
-        const result = db.prepare("INSERT INTO users (username, password_hash, role_id, brand_id, branch_id) VALUES (?, ?, ?, ?, ?)").run(username, hashedPassword, role_id, brand_id || null, branch_id || null);
-        const userId = result.lastInsertRowid;
+      const userId = await db.transaction(async (client) => {
+        const result = await client.query("INSERT INTO users (username, password_hash, role_id, brand_id, branch_id) VALUES ($1, $2, $3, $4, $5) RETURNING id", [username, hashedPassword, role_id, brand_id || null, branch_id || null]);
+        const newUserId = result.rows[0].id;
 
         if (brand_ids && Array.isArray(brand_ids)) {
-          const insertBrand = db.prepare("INSERT INTO user_brands (user_id, brand_id) VALUES (?, ?)");
           for (const bid of brand_ids) {
-            insertBrand.run(userId, bid);
+            await client.query("INSERT INTO user_brands (user_id, brand_id) VALUES ($1, $2)", [newUserId, bid]);
           }
         }
-        return userId;
+        return newUserId;
       });
 
-      const userId = transaction();
       res.json({ id: userId });
     } catch (e) {
+      console.error("Create user error:", e);
       res.status(400).json({ error: "Username already exists" });
     }
   });
 
-  app.put("/api/users/:id", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.put("/api/users/:id", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const { is_active, role_id, username, password, brand_id, branch_id, brand_ids } = req.body;
     const userId = req.params.id;
     
     try {
-      const transaction = db.transaction(() => {
+      await db.transaction(async (client) => {
         if (password) {
           const hashedPassword = bcrypt.hashSync(password, 10);
-          db.prepare("UPDATE users SET username = ?, password_hash = ?, is_active = ?, role_id = ?, brand_id = ?, branch_id = ? WHERE id = ?")
-            .run(username, hashedPassword, is_active ? 1 : 0, role_id, brand_id || null, branch_id || null, userId);
+          await client.query("UPDATE users SET username = $1, password_hash = $2, is_active = $3, role_id = $4, brand_id = $5, branch_id = $6 WHERE id = $7", 
+            [username, hashedPassword, is_active ? 1 : 0, role_id, brand_id || null, branch_id || null, userId]);
         } else {
-          db.prepare("UPDATE users SET username = ?, is_active = ?, role_id = ?, brand_id = ?, branch_id = ? WHERE id = ?")
-            .run(username, is_active ? 1 : 0, role_id, brand_id || null, branch_id || null, userId);
+          await client.query("UPDATE users SET username = $1, is_active = $2, role_id = $3, brand_id = $4, branch_id = $5 WHERE id = $6", 
+            [username, is_active ? 1 : 0, role_id, brand_id || null, branch_id || null, userId]);
         }
 
         // Update multiple brands
-        db.prepare("DELETE FROM user_brands WHERE user_id = ?").run(userId);
+        await client.query("DELETE FROM user_brands WHERE user_id = $1", [userId]);
         if (brand_ids && Array.isArray(brand_ids)) {
-          const insertBrand = db.prepare("INSERT INTO user_brands (user_id, brand_id) VALUES (?, ?)");
           for (const bid of brand_ids) {
-            insertBrand.run(userId, bid);
+            await client.query("INSERT INTO user_brands (user_id, brand_id) VALUES ($1, $2)", [userId, bid]);
           }
         }
       });
 
-      transaction();
       res.json({ success: true });
     } catch (e) {
+      console.error("Update user error:", e);
       res.status(400).json({ error: "Username already exists or update failed" });
     }
   });
 
-  app.delete("/api/users/:id", authenticate, authorize(["Manager", "Super Visor"]), (req, res) => {
+  app.delete("/api/users/:id", authenticate, authorize(["Manager", "Super Visor"]), async (req, res) => {
     const userId = req.params.id;
     // Prevent deleting self
     if (Number(userId) === (req as any).user.id) {
       return res.status(400).json({ error: "Cannot delete yourself" });
     }
-    db.prepare("DELETE FROM users WHERE id = ?").run(userId);
+    await db.query("DELETE FROM users WHERE id = $1", [userId]);
     res.json({ success: true });
   });
 
   // Audit Logs
-  app.get("/api/audit-logs", authenticate, authorize(["Manager", "Call Center", "Super Visor"]), (req, res) => {
-    const logs = db.prepare(`
+  app.get("/api/audit-logs", authenticate, authorize(["Manager", "Call Center", "Super Visor"]), async (req, res) => {
+    const logs = await db.all(`
       SELECT a.*, u.username 
       FROM audit_logs a 
       LEFT JOIN users u ON a.user_id = u.id 
       ORDER BY timestamp DESC LIMIT 100
-    `).all();
+    `);
     res.json(logs);
   });
 
   // Busy Branch Records
-  app.get("/api/busy-periods/export", authenticate, (req, res) => {
-    const restriction = getBrandRestriction((req as any).user);
+  app.get("/api/busy-periods/export", authenticate, async (req, res) => {
+    const restriction = await getBrandRestriction((req as any).user);
     let query = `
       SELECT b.*, u.username 
       FROM busy_period_records b 
@@ -2163,7 +2368,7 @@ async function startServer() {
     const params: any[] = [];
 
     if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_, i) => `$${i + 1}`).join(',');
       if (restriction.type === 'include') {
         query += ` WHERE b.brand IN (${placeholders})`;
       } else {
@@ -2173,7 +2378,7 @@ async function startServer() {
     }
 
     query += " ORDER BY b.created_at DESC";
-    const records = db.prepare(query).all(...params) as any[];
+    const records = await db.all(query, params) as any[];
 
     const formatter = new Intl.DateTimeFormat('en-US', {
       year: 'numeric', month: 'numeric', day: 'numeric',
@@ -2207,9 +2412,9 @@ async function startServer() {
     res.send(buffer);
   });
 
-  app.get("/api/busy-periods", authenticate, (req, res) => {
+  app.get("/api/busy-periods", authenticate, async (req, res) => {
     const user = (req as any).user;
-    const restriction = getBrandRestriction(user);
+    const restriction = await getBrandRestriction(user);
     let query = `
       SELECT b.*, u.username 
       FROM busy_period_records b 
@@ -2220,15 +2425,15 @@ async function startServer() {
     
     if (user.role_name === 'Restaurants') {
       if (user.branch_id) {
-        const branch = db.prepare("SELECT name FROM branches WHERE id = ?").get(user.branch_id) as { name: string };
+        const branch = await db.get("SELECT name FROM branches WHERE id = $1", [user.branch_id]) as { name: string };
         if (branch) {
-          conditions.push("b.branch = ?");
+          conditions.push(`b.branch = $${params.length + 1}`);
           params.push(branch.name);
         } else {
           conditions.push("1 = 0");
         }
       } else if (restriction) {
-        const placeholders = restriction.brands.map(() => '?').join(',');
+        const placeholders = restriction.brands.map((_, i) => `$${params.length + i + 1}`).join(',');
         if (restriction.type === 'include') {
           conditions.push(`b.brand IN (${placeholders})`);
         } else {
@@ -2239,7 +2444,7 @@ async function startServer() {
         conditions.push("1 = 0");
       }
     } else if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_, i) => `$${params.length + i + 1}`).join(',');
       if (restriction.type === 'include') {
         conditions.push(`b.brand IN (${placeholders})`);
       } else {
@@ -2253,16 +2458,15 @@ async function startServer() {
     }
 
     query += " ORDER BY b.created_at DESC LIMIT 500";
-    const records = db.prepare(query).all(...params);
+    const records = await db.all(query, params);
     res.json(records);
   });
 
   // Hidden Items Routes
-  app.get("/api/hidden-items", authenticate, (req, res) => {
+  app.get("/api/hidden-items", authenticate, async (req, res) => {
     const user = (req as any).user;
-    const restriction = getBrandRestriction(user);
-    const productNameField = db.prepare("SELECT id FROM dynamic_fields WHERE name_en = 'Product Name (EN)'").get() as { id: number } | undefined;
-    const productNameFieldId = productNameField?.id || 3;
+    const restriction = await getBrandRestriction(user);
+    const productNameFieldId = await getProductNameFieldId();
 
     let query = `
       SELECT h.*, u.username, b.name as brand_name, br.name as branch_name, 
@@ -2271,7 +2475,7 @@ async function startServer() {
       JOIN users u ON h.user_id = u.id
       JOIN brands b ON h.brand_id = b.id
       LEFT JOIN branches br ON h.branch_id = br.id
-      LEFT JOIN product_field_values fv ON h.product_id = fv.product_id AND fv.field_id = ?
+      LEFT JOIN product_field_values fv ON h.product_id = fv.product_id AND fv.field_id = $1
       LEFT JOIN users uu ON h.updated_by = uu.id
     `;
     const params: any[] = [productNameFieldId];
@@ -2279,10 +2483,10 @@ async function startServer() {
 
     if (user.role_name === 'Restaurants') {
       if (user.branch_id) {
-        conditions.push("h.branch_id = ?");
+        conditions.push(`h.branch_id = $${params.length + 1}`);
         params.push(user.branch_id);
       } else if (restriction) {
-        const placeholders = restriction.brands.map(() => '?').join(',');
+        const placeholders = restriction.brands.map((_, i) => `$${params.length + i + 1}`).join(',');
         if (restriction.type === 'include') {
           conditions.push(`b.name IN (${placeholders})`);
         } else {
@@ -2293,7 +2497,7 @@ async function startServer() {
         conditions.push("1 = 0");
       }
     } else if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_, i) => `$${params.length + i + 1}`).join(',');
       if (restriction.type === 'include') {
         conditions.push(`b.name IN (${placeholders})`);
       } else {
@@ -2307,39 +2511,40 @@ async function startServer() {
     }
 
     query += " ORDER BY h.created_at DESC LIMIT 500";
-    const records = db.prepare(query).all(...params);
+    const records = await db.all(query, params);
     res.json(records);
   });
 
-  app.put("/api/hidden-items/:id", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
+  app.put("/api/hidden-items/:id", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
     const { id } = req.params;
     const { brand_id, branch_id, product_id, agent_name, reason, action_to_unhide, comment, requested_at, responsible_party } = req.body;
     const now = getCurrentKuwaitTime();
     const userId = (req as any).user.id;
 
     try {
-      const oldItem = db.prepare("SELECT * FROM hidden_items WHERE id = ?").get(id);
+      const oldItem = await db.get("SELECT * FROM hidden_items WHERE id = $1", [id]);
       if (!oldItem) {
         return res.status(404).json({ error: "Hidden item not found" });
       }
 
-      const result = db.prepare(`
+      const result = await db.query(`
         UPDATE hidden_items 
-        SET brand_id = ?, branch_id = ?, product_id = ?, agent_name = ?, reason = ?, action_to_unhide = ?, comment = ?, requested_at = ?, responsible_party = ?, updated_at = ?, updated_by = ?
-        WHERE id = ?
-      `).run(brand_id, branch_id, product_id, agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, now, userId, id);
+        SET brand_id = $1, branch_id = $2, product_id = $3, agent_name = $4, reason = $5, action_to_unhide = $6, comment = $7, requested_at = $8, responsible_party = $9, updated_at = $10, updated_by = $11
+        WHERE id = $12
+      `, [brand_id, branch_id, product_id, agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, now, userId, id]);
 
-      if (result.changes > 0) {
+      if (result.rowCount > 0) {
         // Log the edit action
-        const productInfo = db.prepare(`
+        const productNameFieldId = await getProductNameFieldId();
+        const productInfo = await db.get(`
           SELECT fv.value as product_name, b.name as brand_name
           FROM products p
-          LEFT JOIN product_field_values fv ON p.id = fv.product_id AND fv.field_id = (SELECT id FROM dynamic_fields WHERE name_en = 'Product Name (EN)')
+          LEFT JOIN product_field_values fv ON p.id = fv.product_id AND fv.field_id = $1
           LEFT JOIN brands b ON p.brand_id = b.id
-          WHERE p.id = ?
-        `).get(product_id) as any;
+          WHERE p.id = $2
+        `, [productNameFieldId, product_id]) as any;
 
-        const branchInfo = branch_id ? db.prepare("SELECT name FROM branches WHERE id = ?").get(branch_id) as any : { name: 'All Branches' };
+        const branchInfo = branch_id ? await db.get("SELECT name FROM branches WHERE id = $1", [branch_id]) as any : { name: 'All Branches' };
 
         const logData = {
           ...req.body,
@@ -2348,10 +2553,10 @@ async function startServer() {
           branch_name: branchInfo?.name || 'All Branches'
         };
 
-        db.prepare(`
+        await db.query(`
           INSERT INTO audit_logs (user_id, action, target_table, target_id, old_value, new_value, timestamp)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(userId, 'EDIT_HIDDEN_ITEM', 'hidden_items', id, JSON.stringify(oldItem), JSON.stringify(logData), now);
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `, [userId, 'EDIT_HIDDEN_ITEM', 'hidden_items', id, JSON.stringify(oldItem), JSON.stringify(logData), now]);
 
         broadcast({ type: "HIDDEN_ITEMS_UPDATED" });
         res.json({ success: true });
@@ -2364,7 +2569,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/hidden-items", authenticate, authorize(["Technical Back Office", "Manager", "Restaurants", "Super Visor"]), (req, res) => {
+  app.post("/api/hidden-items", authenticate, authorize(["Technical Back Office", "Manager", "Restaurants", "Super Visor"]), async (req, res) => {
     const { 
       brand_id, branch_id, product_ids, agent_name, reason, 
       action_to_unhide, comment, responsible_party 
@@ -2372,110 +2577,105 @@ async function startServer() {
     const requested_at = getCurrentKuwaitTime();
 
     if ((req as any).user.role_name === 'Restaurants') {
-      const result = db.prepare(`
+      const result = await db.query(`
         INSERT INTO pending_requests (user_id, type, data, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run((req as any).user.id, 'hide_unhide', JSON.stringify({ ...req.body, requested_at }), getCurrentKuwaitTime(), getCurrentKuwaitTime());
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+      `, [(req as any).user.id, 'hide_unhide', JSON.stringify({ ...req.body, requested_at }), getCurrentKuwaitTime(), getCurrentKuwaitTime()]);
       
       broadcast({ type: "PENDING_REQUEST_CREATED" });
-      return res.json({ id: result.lastInsertRowid, pending: true });
+      return res.json({ id: result.rows[0].id, pending: true });
     }
 
-    const insertHidden = db.prepare(`
-      INSERT INTO hidden_items (
-        user_id, brand_id, branch_id, product_id, agent_name, reason, 
-        action_to_unhide, comment, requested_at, responsible_party, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    try {
+      await db.transaction(async (client) => {
+        const now = getCurrentKuwaitTime();
+        const productNameFieldId = await getProductNameFieldId();
+        const brand = await db.get("SELECT name FROM brands WHERE id = $1", [brand_id]) as { name: string };
+        
+        if (branch_id === null) {
+          // Hide for all branches of the brand
+          const branches = await db.all("SELECT id, name FROM branches WHERE brand_id = $1", [brand_id]) as { id: number, name: string }[];
+          for (const productId of product_ids) {
+            const product = await db.get(`
+              SELECT fv.value as name 
+              FROM product_field_values fv 
+              WHERE fv.product_id = $1 AND fv.field_id = $2
+            `, [productId, productNameFieldId]) as { name: string };
 
-    const insertHistory = db.prepare(`
-      INSERT INTO hide_history (
-        user_id, brand_id, branch_id, product_id, action,
-        agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, timestamp
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+            for (const branch of branches) {
+              await client.query(`
+                INSERT INTO hidden_items (
+                  user_id, brand_id, branch_id, product_id, agent_name, reason, 
+                  action_to_unhide, comment, requested_at, responsible_party, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+              `, [(req as any).user.id, brand_id, branch.id, productId, agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, now]);
+              
+              await client.query(`
+                INSERT INTO hide_history (
+                  user_id, brand_id, branch_id, product_id, action,
+                  agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, timestamp
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+              `, [(req as any).user.id, brand_id, branch.id, productId, 'HIDE', agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, now]);
+              
+              await logAction((req as any).user.id, "HIDE", "products", productId, null, { 
+                product_name: product?.name || 'Unknown', 
+                brand_name: brand?.name || 'Unknown',
+                branch: branch.name,
+                reason: reason,
+                brand_id: brand_id,
+                branch_id: branch.id
+              });
+            }
+          }
+        } else {
+          // Hide for specific branch
+          const branch = await db.get("SELECT name FROM branches WHERE id = $1", [branch_id]) as { name: string };
+          for (const productId of product_ids) {
+            const product = await db.get(`
+              SELECT fv.value as name 
+              FROM product_field_values fv 
+              WHERE fv.product_id = $1 AND fv.field_id = $2
+            `, [productId, productNameFieldId]) as { name: string };
 
-    const transaction = db.transaction((data) => {
-      const now = getCurrentKuwaitTime();
-      if (data.branch_id === null) {
-        // Hide for all branches of the brand
-        const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(data.brand_id) as { name: string };
-        const branches = db.prepare("SELECT id, name FROM branches WHERE brand_id = ?").all(data.brand_id) as { id: number, name: string }[];
-        const productNameFieldId = getProductNameFieldId();
-        for (const productId of data.product_ids) {
-          const product = db.prepare(`
-            SELECT fv.value as name 
-            FROM product_field_values fv 
-            WHERE fv.product_id = ? AND fv.field_id = ?
-          `).get(productId, productNameFieldId) as { name: string };
-
-          for (const branch of branches) {
-            insertHidden.run(
-              (req as any).user.id, data.brand_id, branch.id, productId, 
-              data.agent_name, data.reason, data.action_to_unhide, 
-              data.comment, data.requested_at, data.responsible_party, now
-            );
-            insertHistory.run(
-              (req as any).user.id, data.brand_id, branch.id, productId, 'HIDE',
-              data.agent_name, data.reason, data.action_to_unhide, 
-              data.comment, data.requested_at, data.responsible_party, now
-            );
-            logAction((req as any).user.id, "HIDE", "products", productId, null, { 
+            await client.query(`
+              INSERT INTO hidden_items (
+                user_id, brand_id, branch_id, product_id, agent_name, reason, 
+                action_to_unhide, comment, requested_at, responsible_party, created_at
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            `, [(req as any).user.id, brand_id, branch_id, productId, agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, now]);
+            
+            await client.query(`
+              INSERT INTO hide_history (
+                user_id, brand_id, branch_id, product_id, action,
+                agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, timestamp
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            `, [(req as any).user.id, brand_id, branch_id, productId, 'HIDE', agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, now]);
+            
+            await logAction((req as any).user.id, "HIDE", "products", productId, null, { 
               product_name: product?.name || 'Unknown', 
               brand_name: brand?.name || 'Unknown',
-              branch: branch.name,
-              reason: data.reason,
-              brand_id: data.brand_id,
-              branch_id: branch.id
+              branch: branch?.name || 'Unknown',
+              reason: reason,
+              brand_id: brand_id,
+              branch_id: branch_id
             });
           }
         }
-      } else {
-        // Hide for specific branch
-        const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(data.brand_id) as { name: string };
-        const branch = db.prepare("SELECT name FROM branches WHERE id = ?").get(data.branch_id) as { name: string };
-        const productNameFieldId = getProductNameFieldId();
-        for (const productId of data.product_ids) {
-          const product = db.prepare(`
-            SELECT fv.value as name 
-            FROM product_field_values fv 
-            WHERE fv.product_id = ? AND fv.field_id = ?
-          `).get(productId, productNameFieldId) as { name: string };
+      });
 
-          insertHidden.run(
-            (req as any).user.id, data.brand_id, data.branch_id, productId, 
-            data.agent_name, data.reason, data.action_to_unhide, 
-            data.comment, data.requested_at, data.responsible_party, now
-          );
-          insertHistory.run(
-            (req as any).user.id, data.brand_id, data.branch_id, productId, 'HIDE',
-            data.agent_name, data.reason, data.action_to_unhide, 
-            data.comment, data.requested_at, data.responsible_party, now
-          );
-          logAction((req as any).user.id, "HIDE", "products", productId, null, { 
-            product_name: product?.name || 'Unknown', 
-            brand_name: brand?.name || 'Unknown',
-            branch: branch?.name || 'Unknown',
-            reason: data.reason,
-            brand_id: data.brand_id,
-            branch_id: data.branch_id
-          });
-        }
-      }
-    });
-
-    transaction({ 
-      brand_id, branch_id, product_ids, agent_name, reason, 
-      action_to_unhide, comment, requested_at, responsible_party 
-    });
-
-    broadcast({ type: "HIDDEN_ITEMS_UPDATED" });
-    res.json({ success: true });
+      broadcast({ type: "HIDDEN_ITEMS_UPDATED" });
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error adding hidden items:", error);
+      res.status(500).json({ error: "Failed to add hidden items" });
+    }
   });
 
-  app.get("/api/hidden-items/export", authenticate, (req, res) => {
-    const restriction = getBrandRestriction((req as any).user);
+  app.get("/api/hidden-items/export", authenticate, async (req, res) => {
+    const restriction = await getBrandRestriction((req as any).user);
     let query = `
       SELECT 
         hi.id,
@@ -2494,14 +2694,14 @@ async function startServer() {
       JOIN brands b ON hi.brand_id = b.id
       LEFT JOIN branches br ON hi.branch_id = br.id
       JOIN products p ON hi.product_id = p.id
-      JOIN product_field_values fv ON p.id = fv.product_id AND fv.field_id = ?
+      JOIN product_field_values fv ON p.id = fv.product_id AND fv.field_id = $1
       JOIN users u ON hi.user_id = u.id
     `;
-    const productNameFieldId = getProductNameFieldId();
+    const productNameFieldId = await getProductNameFieldId();
     const params: any[] = [productNameFieldId];
 
     if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_, i) => `$${i + 2}`).join(',');
       if (restriction.type === 'include') {
         query += ` WHERE b.name IN (${placeholders})`;
       } else {
@@ -2511,7 +2711,7 @@ async function startServer() {
     }
 
     query += " ORDER BY hi.created_at DESC";
-    const records = db.prepare(query).all(...params);
+    const records = await db.all(query, params);
 
     const formatter = new Intl.DateTimeFormat('en-US', {
       year: 'numeric', month: 'numeric', day: 'numeric',
@@ -2543,17 +2743,17 @@ async function startServer() {
     res.send(buffer);
   });
 
-  app.get("/api/export-history", authenticate, authorize(["Technical Back Office", "Manager", "Call Center", "Super Visor"]), (req, res) => {
+  app.get("/api/export-history", authenticate, authorize(["Technical Back Office", "Manager", "Call Center", "Super Visor"]), async (req, res) => {
     const { startDate, endDate, brandId, branchId } = req.query as any;
 
-    const logs = db.prepare(`
+    const logs = await db.all(`
       SELECT l.*, u.username
       FROM audit_logs l
       JOIN users u ON l.user_id = u.id
       WHERE (l.action = 'HIDE' OR l.action = 'UNHIDE' OR l.action = 'EDIT_HIDDEN_ITEM')
       AND (l.target_table = 'products' OR l.target_table = 'hidden_items')
       ORDER BY l.timestamp ASC
-    `).all() as any[];
+    `) as any[];
 
     const sessions: any[] = [];
     const activeSessions: { [key: string]: any } = {};
@@ -2674,7 +2874,7 @@ async function startServer() {
     if (startDate) {
       const start = new Date(startDate);
       start.setHours(0, 0, 0, 0);
-      filteredSessions = filteredSessions.filter(s => {
+      filteredSessions = filteredSessions = filteredSessions.filter(s => {
         const hideTime = s['Hide Time'] ? new Date(s['Hide Time'] + (s['Hide Time'].includes('Z') || s['Hide Time'].includes('T') ? '' : 'Z')) : null;
         const unhideTime = s['Unhide Time'] ? new Date(s['Unhide Time'] + (s['Unhide Time'].includes('Z') || s['Unhide Time'].includes('T') ? '' : 'Z')) : null;
         return (hideTime && hideTime >= start) || (unhideTime && unhideTime >= start);
@@ -2692,7 +2892,7 @@ async function startServer() {
     }
 
     if (brandId) {
-      const brand = db.prepare("SELECT name FROM brands WHERE id = ?").get(brandId) as { name: string };
+      const brand = await db.get("SELECT name FROM brands WHERE id = $1", [brandId]) as { name: string };
       filteredSessions = filteredSessions.filter(s => {
         if (s.brand_id) return String(s.brand_id) === String(brandId);
         // Fallback for older logs
@@ -2704,7 +2904,7 @@ async function startServer() {
       if (branchId === 'all') {
         filteredSessions = filteredSessions.filter(s => s.Branch === 'All Branches');
       } else {
-        const branch = db.prepare("SELECT name FROM branches WHERE id = ?").get(branchId) as { name: string };
+        const branch = await db.get("SELECT name FROM branches WHERE id = $1", [branchId]) as { name: string };
         filteredSessions = filteredSessions.filter(s => {
           if (s.branch_id) return String(s.branch_id) === String(branchId);
           // Fallback for older logs
@@ -2760,94 +2960,92 @@ async function startServer() {
     res.send(buffer);
   });
 
-  app.delete("/api/hidden-items/:id", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
-    const item = db.prepare(`
+  app.delete("/api/hidden-items/:id", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
+    const item = await db.get(`
       SELECT hi.*, fv.value as product_name, br.name as branch_name, b.name as brand_name
       FROM hidden_items hi
-      LEFT JOIN product_field_values fv ON hi.product_id = fv.product_id AND fv.field_id = ?
+      LEFT JOIN product_field_values fv ON hi.product_id = fv.product_id AND fv.field_id = $1
       LEFT JOIN branches br ON hi.branch_id = br.id
       LEFT JOIN brands b ON hi.brand_id = b.id
-      WHERE hi.id = ?
-    `).get(getProductNameFieldId(), req.params.id) as any;
+      WHERE hi.id = $2
+    `, [await getProductNameFieldId(), req.params.id]) as any;
 
     if (item) {
       const unhide_at = getCurrentKuwaitTime();
-      logAction((req as any).user.id, "UNHIDE", "products", item.product_id, { 
+      await logAction((req as any).user.id, "UNHIDE", "products", item.product_id, { 
         product_name: item.product_name || 'Unknown Product', 
         brand_name: item.brand_name || 'Unknown Brand',
         branch: item.branch_name || 'All Branches',
         brand_id: item.brand_id,
         branch_id: item.branch_id
       }, null);
-      db.prepare(`
+      await db.query(`
         INSERT INTO hide_history (
           user_id, brand_id, branch_id, product_id, action,
           agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `, [
         (req as any).user.id, item.brand_id, item.branch_id, item.product_id, 'UNHIDE',
         item.agent_name, item.reason, item.action_to_unhide, 
         item.comment, unhide_at, item.responsible_party, unhide_at
-      );
+      ]);
     }
 
-    db.prepare("DELETE FROM hidden_items WHERE id = ?").run(req.params.id);
+    await db.query("DELETE FROM hidden_items WHERE id = $1", [req.params.id]);
     broadcast({ type: "HIDDEN_ITEMS_UPDATED" });
     res.json({ success: true });
   });
 
-  app.post("/api/hidden-items/bulk-unhide", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), (req, res) => {
+  app.post("/api/hidden-items/bulk-unhide", authenticate, authorize(["Technical Back Office", "Manager", "Super Visor"]), async (req, res) => {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: "Invalid IDs" });
     }
-    
-    const deleteStmt = db.prepare("DELETE FROM hidden_items WHERE id = ?");
-    const getInfoStmt = db.prepare(`
-      SELECT hi.*, fv.value as product_name, br.name as branch_name, b.name as brand_name
-      FROM hidden_items hi
-      LEFT JOIN product_field_values fv ON hi.product_id = fv.product_id AND fv.field_id = ?
-      LEFT JOIN branches br ON hi.branch_id = br.id
-      LEFT JOIN brands b ON hi.brand_id = b.id
-      WHERE hi.id = ?
-    `);
 
-    const productNameFieldId = getProductNameFieldId();
-
-    const transaction = db.transaction((ids: number[]) => {
-      console.log(`Processing bulk unhide for IDs: ${ids.join(', ')}`);
+    await db.transaction(async (client) => {
       const unhide_at = getCurrentKuwaitTime();
+      const productNameFieldId = await getProductNameFieldId();
+
       for (const id of ids) {
-        const item = getInfoStmt.get(productNameFieldId, id) as any;
+        const item = await client.query(`
+          SELECT hi.*, fv.value as product_name, br.name as branch_name, b.name as brand_name
+          FROM hidden_items hi
+          LEFT JOIN product_field_values fv ON hi.product_id = fv.product_id AND fv.field_id = $1
+          LEFT JOIN branches br ON hi.branch_id = br.id
+          LEFT JOIN brands b ON hi.brand_id = b.id
+          WHERE hi.id = $2
+        `, [productNameFieldId, id]).then(res => res.rows[0]) as any;
+
         if (item) {
-          logAction((req as any).user.id, "UNHIDE", "products", item.product_id, { 
+          await logAction((req as any).user.id, "UNHIDE", "products", item.product_id, { 
             product_name: item.product_name || 'Unknown Product', 
             brand_name: item.brand_name || 'Unknown Brand',
             branch: item.branch_name || 'All Branches',
             brand_id: item.brand_id,
             branch_id: item.branch_id
           }, null);
-          db.prepare(`
+
+          await client.query(`
             INSERT INTO hide_history (
               user_id, brand_id, branch_id, product_id, action,
               agent_name, reason, action_to_unhide, comment, requested_at, responsible_party, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          `, [
             (req as any).user.id, item.brand_id, item.branch_id, item.product_id, 'UNHIDE',
             item.agent_name, item.reason, item.action_to_unhide, 
             item.comment, unhide_at, item.responsible_party, unhide_at
-          );
+          ]);
+
+          await client.query("DELETE FROM hidden_items WHERE id = $1", [id]);
         }
-        deleteStmt.run(id);
       }
     });
-    
-    transaction(ids);
+
     broadcast({ type: "HIDDEN_ITEMS_UPDATED" });
     res.json({ success: true });
   });
 
-  app.post("/api/busy-periods", authenticate, (req, res) => {
+  app.post("/api/busy-periods", authenticate, async (req, res) => {
     const { 
       date, brand, branch, reason_category, responsible_party, 
       comment, internal_notes 
@@ -2866,40 +3064,42 @@ async function startServer() {
     const total_duration_minutes = 0;
 
     if ((req as any).user.role_name === 'Restaurants') {
-      const result = db.prepare(`
+      const result = await db.query(`
         INSERT INTO pending_requests (user_id, type, data, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run((req as any).user.id, 'busy_branch', JSON.stringify({ ...req.body, start_time, end_time, total_duration, total_duration_minutes }), getCurrentKuwaitTime(), getCurrentKuwaitTime());
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+      `, [(req as any).user.id, 'busy_branch', JSON.stringify({ ...req.body, start_time, end_time, total_duration, total_duration_minutes }), getCurrentKuwaitTime(), getCurrentKuwaitTime()]);
       
       broadcast({ type: "PENDING_REQUEST_CREATED" });
-      return res.json({ id: result.lastInsertRowid, pending: true });
+      return res.json({ id: result.rows[0].id, pending: true });
     }
     
-    const result = db.prepare(`
+    const result = await db.query(`
       INSERT INTO busy_period_records (
         user_id, date, brand, branch, start_time, end_time, 
         total_duration, total_duration_minutes, reason_category, responsible_party, 
         comment, internal_notes, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING id
+    `, [
       (req as any).user.id, date, brand, branch, start_time, end_time,
       total_duration, total_duration_minutes, reason_category, responsible_party,
       comment, internal_notes, getCurrentKuwaitTime()
-    );
+    ]);
     
-    logAction((req as any).user.id, "BUSY", "busy_period_records", Number(result.lastInsertRowid), null, { 
+    await logAction((req as any).user.id, "BUSY", "busy_period_records", Number(result.rows[0].id), null, { 
       date, brand, branch, start_time, end_time, total_duration, reason_category 
     });
     
     broadcast({ type: "BUSY_PERIOD_CREATED" });
-    res.json({ id: result.lastInsertRowid });
+    res.json({ id: result.rows[0].id });
   });
 
-  app.put("/api/busy-periods/:id", authenticate, (req, res) => {
+  app.put("/api/busy-periods/:id", authenticate, async (req, res) => {
     const { id } = req.params;
     let { action, end_time, total_duration, total_duration_minutes } = req.body;
     
-    const record = db.prepare("SELECT * FROM busy_period_records WHERE id = ?").get(id) as any;
+    const record = await db.get("SELECT * FROM busy_period_records WHERE id = $1", [id]) as any;
     if (!record) return res.status(404).json({ error: "Record not found" });
 
     if (action === 'OPEN' || !end_time) {
@@ -2934,13 +3134,13 @@ async function startServer() {
       }
     }
 
-    db.prepare(`
+    await db.query(`
       UPDATE busy_period_records 
-      SET end_time = ?, total_duration = ?, total_duration_minutes = ?
-      WHERE id = ?
-    `).run(end_time, total_duration, total_duration_minutes || 0, id);
+      SET end_time = $1, total_duration = $2, total_duration_minutes = $3
+      WHERE id = $4
+    `, [end_time, total_duration, total_duration_minutes || 0, id]);
     
-    logAction((req as any).user.id, "BUSY_UPDATE", "busy_period_records", Number(id), null, { 
+    await logAction((req as any).user.id, "BUSY_UPDATE", "busy_period_records", Number(id), null, { 
       brand: record.brand, branch: record.branch, end_time, total_duration, reason_category: record.reason_category 
     });
     
@@ -2949,26 +3149,26 @@ async function startServer() {
   });
 
   // Busy Branch Config Routes
-  app.get("/api/branches", authenticate, (req, res) => {
+  app.get("/api/branches", authenticate, async (req, res) => {
     const user = (req as any).user;
     const { brand_id, all } = req.query;
-    const restriction = all === 'true' ? null : getBrandRestriction(user);
+    const restriction = all === 'true' ? null : await getBrandRestriction(user);
     let query = "SELECT b.*, br.name as brand_name FROM branches b JOIN brands br ON b.brand_id = br.id";
     const params: any[] = [];
     const conditions: string[] = [];
 
     if (brand_id) {
-      conditions.push("b.brand_id = ?");
+      conditions.push("b.brand_id = $" + (params.length + 1));
       params.push(brand_id);
     }
 
     if (user.branch_id) {
-      conditions.push("b.id = ?");
+      conditions.push("b.id = $" + (params.length + 1));
       params.push(user.branch_id);
     }
 
     if (restriction) {
-      const placeholders = restriction.brands.map(() => '?').join(',');
+      const placeholders = restriction.brands.map((_, i) => '$' + (params.length + i + 1)).join(',');
       if (restriction.type === 'include') {
         conditions.push(`br.name IN (${placeholders})`);
       } else {
@@ -2981,53 +3181,53 @@ async function startServer() {
       query += " WHERE " + conditions.join(" AND ");
     }
 
-    const branches = db.prepare(query).all(...params);
+    const branches = await db.all(query, params);
     res.json(branches);
   });
 
-  app.post("/api/branches", authenticate, authorize(["Technical Back Office", "Manager"]), (req, res) => {
+  app.post("/api/branches", authenticate, authorize(["Technical Back Office", "Manager"]), async (req, res) => {
     const { brand_id, name } = req.body;
-    db.prepare("INSERT INTO branches (brand_id, name) VALUES (?, ?)").run(brand_id, name);
+    await db.query("INSERT INTO branches (brand_id, name) VALUES ($1, $2)", [brand_id, name]);
     res.json({ success: true });
   });
 
-  app.delete("/api/branches/:id", authenticate, authorize(["Technical Back Office", "Manager"]), (req, res) => {
-    db.prepare("DELETE FROM branches WHERE id = ?").run(req.params.id);
+  app.delete("/api/branches/:id", authenticate, authorize(["Technical Back Office", "Manager"]), async (req, res) => {
+    await db.query("DELETE FROM branches WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
-  app.get("/api/busy-reasons", authenticate, (req, res) => {
-    const reasons = db.prepare("SELECT * FROM busy_branch_reasons").all();
+  app.get("/api/busy-reasons", authenticate, async (req, res) => {
+    const reasons = await db.all("SELECT * FROM busy_branch_reasons");
     res.json(reasons);
   });
 
-  app.post("/api/busy-reasons", authenticate, authorize(["Manager"]), (req, res) => {
-    db.prepare("INSERT INTO busy_branch_reasons (name) VALUES (?)").run(req.body.name);
+  app.post("/api/busy-reasons", authenticate, authorize(["Manager"]), async (req, res) => {
+    await db.query("INSERT INTO busy_branch_reasons (name) VALUES ($1)", [req.body.name]);
     res.json({ success: true });
   });
 
-  app.delete("/api/busy-reasons/:id", authenticate, authorize(["Manager"]), (req, res) => {
-    db.prepare("DELETE FROM busy_branch_reasons WHERE id = ?").run(req.params.id);
+  app.delete("/api/busy-reasons/:id", authenticate, authorize(["Manager"]), async (req, res) => {
+    await db.query("DELETE FROM busy_branch_reasons WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
-  app.get("/api/busy-responsible", authenticate, (req, res) => {
-    const resp = db.prepare("SELECT * FROM busy_branch_responsible").all();
+  app.get("/api/busy-responsible", authenticate, async (req, res) => {
+    const resp = await db.all("SELECT * FROM busy_branch_responsible");
     res.json(resp);
   });
 
-  app.post("/api/busy-responsible", authenticate, authorize(["Technical Back Office", "Manager"]), (req, res) => {
-    db.prepare("INSERT INTO busy_branch_responsible (name) VALUES (?)").run(req.body.name);
+  app.post("/api/busy-responsible", authenticate, authorize(["Technical Back Office", "Manager"]), async (req, res) => {
+    await db.query("INSERT INTO busy_branch_responsible (name) VALUES ($1)", [req.body.name]);
     res.json({ success: true });
   });
 
-  app.delete("/api/busy-responsible/:id", authenticate, authorize(["Technical Back Office", "Manager"]), (req, res) => {
-    db.prepare("DELETE FROM busy_branch_responsible WHERE id = ?").run(req.params.id);
+  app.delete("/api/busy-responsible/:id", authenticate, authorize(["Technical Back Office", "Manager"]), async (req, res) => {
+    await db.query("DELETE FROM busy_branch_responsible WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   });
 
   // Reports Routes
-  app.get("/api/reports/brands", authenticate, (req, res) => {
+  app.get("/api/reports/brands", authenticate, async (req, res) => {
     const { brand_id } = req.query;
     let query = `
       SELECT 
@@ -3038,23 +3238,23 @@ async function startServer() {
     `;
     const params: any[] = [];
     if (brand_id) {
-      query += " WHERE b.id = ?";
+      query += " WHERE b.id = $1";
       params.push(brand_id);
     }
     query += " ORDER BY total_products DESC";
     
-    const report = db.prepare(query).all(...params);
+    const report = await db.all(query, params);
     res.json(report);
   });
 
-  app.get("/api/reports/branch-hides", authenticate, (req, res) => {
+  app.get("/api/reports/branch-hides", authenticate, async (req, res) => {
     const { branch_id, brand_id, date } = req.query;
     let query = `
       SELECT 
         br.name as branch_name,
-        COUNT(CASE WHEN date(hh.timestamp, '+3 hours') = date('now', '+3 hours') THEN 1 END) as today_count,
-        COUNT(CASE WHEN date(hh.timestamp, '+3 hours') >= date('now', '+3 hours', '-7 days') THEN 1 END) as week_count,
-        COUNT(CASE WHEN date(hh.timestamp, '+3 hours') >= date('now', '+3 hours', '-30 days') THEN 1 END) as month_count,
+        COUNT(CASE WHEN (hh.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date THEN 1 END) as today_count,
+        COUNT(CASE WHEN (hh.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '7 days' THEN 1 END) as week_count,
+        COUNT(CASE WHEN (hh.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '30 days' THEN 1 END) as month_count,
         COUNT(hh.id) as total_count
       FROM branches br
       LEFT JOIN hide_history hh ON br.id = hh.branch_id AND hh.action = 'HIDE'
@@ -3063,31 +3263,25 @@ async function startServer() {
     const conditions: string[] = [];
 
     if (branch_id) {
-      conditions.push("br.id = ?");
+      conditions.push("br.id = $" + (params.length + 1));
       params.push(branch_id);
     }
     if (brand_id) {
-      conditions.push("br.brand_id = ?");
+      conditions.push("br.brand_id = $" + (params.length + 1));
       params.push(brand_id);
-    }
-    if (date) {
-      // If date is provided, we might want to filter the counts based on that date
-      // But the report structure is fixed (Today, Week, Month).
-      // Maybe the user wants to see counts *relative* to that date?
-      // For now, I'll just filter the branches.
     }
 
     if (conditions.length > 0) {
       query += " WHERE " + conditions.join(" AND ");
     }
 
-    query += " GROUP BY br.id ORDER BY total_count DESC";
+    query += " GROUP BY br.id, br.name ORDER BY total_count DESC";
     
-    const report = db.prepare(query).all(...params);
+    const report = await db.all(query, params);
     res.json(report);
   });
 
-  app.get("/api/reports/branch-busy", authenticate, (req, res) => {
+  app.get("/api/reports/branch-busy", authenticate, async (req, res) => {
     const { branch_id, brand_id, date, period } = req.query;
     let query = `
       SELECT 
@@ -3101,23 +3295,31 @@ async function startServer() {
     const conditions: string[] = [];
 
     if (branch_id) {
-      // branch_id in busy_period_records is a string (branch name)
-      // I should probably join with branches table if I want to filter by ID
-      // but for now I'll use the name if provided as a string or join.
-      // Actually, busy_period_records stores 'branch' as name.
+      const branchResult = await db.get("SELECT name FROM branches WHERE id = $1", [branch_id]) as { name: string };
+      if (branchResult) {
+        conditions.push("branch = $" + (params.length + 1));
+        params.push(branchResult.name);
+      }
     }
-    
+    if (brand_id) {
+      const brandResult = await db.get("SELECT name FROM brands WHERE id = $1", [brand_id]) as { name: string };
+      if (brandResult) {
+        conditions.push("brand = $" + (params.length + 1));
+        params.push(brandResult.name);
+      }
+    }
+
     if (date) {
-      conditions.push("date = ?");
+      conditions.push("date = $" + (params.length + 1));
       params.push(date);
     }
 
     if (period === 'today') {
-      conditions.push("date(created_at, '+3 hours') = date('now', '+3 hours')");
+      conditions.push("(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date");
     } else if (period === 'week') {
-      conditions.push("date(created_at, '+3 hours') >= date('now', '+3 hours', '-7 days')");
+      conditions.push("(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '7 days'");
     } else if (period === 'month') {
-      conditions.push("date(created_at, '+3 hours') >= date('now', '+3 hours', '-30 days')");
+      conditions.push("(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '30 days'");
     }
 
     if (conditions.length > 0) {
@@ -3126,38 +3328,38 @@ async function startServer() {
 
     query += " GROUP BY branch ORDER BY total_minutes DESC";
     
-    const report = db.prepare(query).all(...params);
+    const report = await db.all(query, params);
     res.json(report);
   });
 
-  app.get("/api/reports/reasons", authenticate, (req, res) => {
+  app.get("/api/reports/reasons", authenticate, async (req, res) => {
     const { period } = req.query;
     let query = `SELECT reason_category as name, COUNT(*) as value FROM busy_period_records`;
     const conditions = [];
-    if (period === 'today') conditions.push("date(created_at, '+3 hours') = date('now', '+3 hours')");
-    else if (period === 'week') conditions.push("date(created_at, '+3 hours') >= date('now', '+3 hours', '-7 days')");
-    else if (period === 'month') conditions.push("date(created_at, '+3 hours') >= date('now', '+3 hours', '-30 days')");
+    if (period === 'today') conditions.push("(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date");
+    else if (period === 'week') conditions.push("(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '7 days'");
+    else if (period === 'month') conditions.push("(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '30 days'");
     
     if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
     query += " GROUP BY reason_category ORDER BY value DESC";
-    res.json(db.prepare(query).all());
+    res.json(await db.all(query));
   });
 
-  app.get("/api/reports/timeline", authenticate, (req, res) => {
+  app.get("/api/reports/timeline", authenticate, async (req, res) => {
     const query = `
       SELECT 
-        date(created_at, '+3 hours') as date,
+        (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date as date,
         COUNT(*) as incidents,
         SUM(total_duration_minutes) as duration
       FROM busy_period_records
-      WHERE date(created_at, '+3 hours') >= date('now', '+3 hours', '-30 days')
-      GROUP BY date(created_at, '+3 hours')
+      WHERE (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '30 days'
+      GROUP BY (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date
       ORDER BY date ASC
     `;
-    res.json(db.prepare(query).all());
+    res.json(await db.all(query));
   });
 
-  app.get("/api/reports/user-kpi", authenticate, (req, res) => {
+  app.get("/api/reports/user-kpi", authenticate, async (req, res) => {
     const user = (req as any).user;
     let { user_id, period } = req.query;
     
@@ -3180,22 +3382,22 @@ async function startServer() {
     const conditions: string[] = [];
     
     if (user_id && user_id !== 'all') {
-      conditions.push("al.user_id = ?");
+      conditions.push("al.user_id = $" + (params.length + 1));
       params.push(user_id);
     }
     
-    if (period === 'today') conditions.push("date(al.timestamp, '+3 hours') = date('now', '+3 hours')");
-    else if (period === 'week') conditions.push("date(al.timestamp, '+3 hours') >= date('now', '+3 hours', '-7 days')");
-    else if (period === 'month') conditions.push("date(al.timestamp, '+3 hours') >= date('now', '+3 hours', '-30 days')");
+    if (period === 'today') conditions.push("(al.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date");
+    else if (period === 'week') conditions.push("(al.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '7 days'");
+    else if (period === 'month') conditions.push("(al.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '30 days'");
     
     if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
-    query += " GROUP BY u.username, al.action, al.target_table ORDER BY count DESC";
+    query += " GROUP BY u.id, u.username, al.action, al.target_table ORDER BY count DESC";
     
-    const report = db.prepare(query).all(...params);
+    const report = await db.all(query, params);
     res.json(report);
   });
 
-  app.get("/api/reports/user-activity-details", authenticate, (req, res) => {
+  app.get("/api/reports/user-activity-details", authenticate, async (req, res) => {
     const user = (req as any).user;
     let { user_id, period } = req.query;
 
@@ -3221,27 +3423,28 @@ async function startServer() {
     const conditions: string[] = [];
     
     if (user_id && user_id !== 'all') {
-      conditions.push("al.user_id = ?");
+      conditions.push("al.user_id = $" + (params.length + 1));
       params.push(user_id);
     }
     
-    if (period === 'today') conditions.push("date(al.timestamp, '+3 hours') = date('now', '+3 hours')");
-    else if (period === 'week') conditions.push("date(al.timestamp, '+3 hours') >= date('now', '+3 hours', '-7 days')");
-    else if (period === 'month') conditions.push("date(al.timestamp, '+3 hours') >= date('now', '+3 hours', '-30 days')");
+    if (period === 'today') conditions.push("(al.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date");
+    else if (period === 'week') conditions.push("(al.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '7 days'");
+    else if (period === 'month') conditions.push("(al.timestamp AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kuwait')::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kuwait')::date - INTERVAL '30 days'");
     
     if (conditions.length > 0) query += " WHERE " + conditions.join(" AND ");
     query += " ORDER BY al.timestamp DESC LIMIT 500";
     
-    const logs = db.prepare(query).all(...params);
+    const logs = await db.all(query, params);
     res.json(logs);
   });
-  app.get("/api/export", authenticate, (req, res) => {
-    const products = db.prepare(`
+
+  app.get("/api/export", authenticate, async (req, res) => {
+    const products = await db.all(`
       SELECT p.id, b.name as brand, pc.code as product_code, p.created_at
       FROM products p
       JOIN brands b ON p.brand_id = b.id
       LEFT JOIN product_codes pc ON p.id = pc.product_id
-    `).all();
+    `);
     
     const ws = XLSX.utils.json_to_sheet(products);
     const wb = XLSX.utils.book_new();
