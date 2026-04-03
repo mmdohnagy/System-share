@@ -129,7 +129,7 @@ async function seedData() {
   }
 
   // Create default admin if no users exist
-  const userCount = await db.get("SELECT COUNT(*) FROM users");
+  const userCount = await db.get("SELECT COUNT(*) as count FROM users");
   let adminUserId = 0;
   if (Number(userCount.count) === 0) {
     const adminRole = await db.get("SELECT id FROM roles WHERE name = $1", ["Technical Back Office"]);
@@ -142,7 +142,7 @@ async function seedData() {
     console.log("Default admin user created: admin / admin123");
   } else {
     const admin = await db.get("SELECT id FROM users WHERE username = $1", ["admin"]);
-    adminUserId = admin.id;
+    adminUserId = admin?.id || 0;
   }
 
   // Ensure Brand BBT exists
