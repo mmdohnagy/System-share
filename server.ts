@@ -3456,30 +3456,27 @@ async function startServer() {
     res.send(buf);
   });
 
-  // Vite middleware for development
-  const isProduction = process.env.NODE_ENV === "production";
+  // Serve static files
+  const isProduction = process.env.NODE_ENV === "production" || process.env.RAILWAY_ENVIRONMENT_NAME !== undefined;
   const distPath = path.join(process.cwd(), "dist");
-  const distExists = fs.existsSync(distPath);
-
-  if (isProduction && distExists) {
-    console.log("Serving static files from dist:", distPath);
+  
+  if (fs.existsSync(distPath)) {
+    console.log("Production mode: Serving static files from", distPath);
     app.use(express.static(distPath));
     app.get("*", (req, res, next) => {
-      // Avoid intercepting API routes
-      if (req.url.startsWith('/api')) return next();
+      if (req.url.startsWith("/api")) return next();
       res.sendFile(path.join(distPath, "index.html"));
     });
   } else {
-    console.log("Using Vite middleware... (Starting createViteServer)");
+    console.log("Development mode: Starting Vite middleware...");
     try {
       const vite = await createViteServer({
         server: { middlewareMode: true },
         appType: "spa",
       });
-      console.log("Vite server created successfully.");
       app.use(vite.middlewares);
-    } catch (viteErr) {
-      console.error("Failed to create Vite server:", viteErr);
+    } catch (e) {
+      console.error("Vite middleware failed:", e);
     }
   }
 
