@@ -211,11 +211,8 @@ async function initDb() {
     console.warn("WARNING: DATABASE_URL is not set. Database operations will fail.");
     return;
   }
-  if (process.env.DATABASE_URL.includes('postgres.railway.internal')) {
-    console.error("CRITICAL ERROR: You are using an INTERNAL Railway URL. Please update DATABASE_URL in Settings to use the PUBLIC URL (DATABASE_PUBLIC_URL).");
-    throw new Error("Internal Railway URL detected. Connection will fail from outside Railway.");
-  }
 
+  console.log("Initializing database schema...");
   await db.exec(`
     CREATE TABLE IF NOT EXISTS roles (
       id SERIAL PRIMARY KEY,
@@ -3461,34 +3458,19 @@ async function startServer() {
   });
 
   // Serve static files
-  const distPath = path.resolve(__dirname, "dist");
+  const distPath = path.join(process.cwd(), "dist");
   const distExists = fs.existsSync(distPath);
   
-  console.log("Checking for static files at:", distPath);
-  console.log("Static files directory exists:", distExists);
-
+  console.log("--- STATIC FILES DEBUG ---");
+  console.log("Current Working Directory (cwd):", process.cwd());
+  console.log("Expected Dist Path:", distPath);
+  console.log("Dist Folder Exists:", distExists);
   if (distExists) {
-    console.log("Production mode: Serving static files from", distPath);
-    
-    // Serve static files first
-    app.use(express.static(distPath, {
-      index: false,
-      maxAge: '1d'
-    }));
-    
-    // SPA fallback: Serve index.html for any non-API route
-    app.get("*", (req, res, next) => {
-      // Don't intercept API calls
-      if (req.url.startsWith("/api")) return next();
-      
-      res.sendFile(path.join(distPath, "index.html"), (err) => {
-        if (err) {
-          console.error("Error sending index.html:", err);
-          res.status(500).send("Error loading page");
-        }
-      });
-    });
-  } else if (process.env.NODE_ENV !== "production") {
+    console.log("Contents of dist:", fs.readdirSync(distPath));
+  }
+  console.log("--------------------------");
+
+  if (process.env.NODE_ENV !== "production") {
     console.log("Development mode: Starting Vite middleware...");
     try {
       const vite = await createViteServer({
@@ -3499,6 +3481,21 @@ async function startServer() {
     } catch (e) {
       console.error("Vite middleware failed:", e);
     }
+  } else if (distExists) {
+    console.log("Production mode: Serving from dist folder");
+    app.use(express.static(distPath));
+    
+    app.get("*", (req, res, next) => {
+      if (req.url.startsWith("/api")) return next();
+      
+      const filePath = path.join(distPath, "index.html");
+      if (fs.existsSync(filePath)) {
+        res.sendFile(filePath);
+      } else {
+        console.error("CRITICAL: index.html not found at", filePath);
+        res.status(404).send("Frontend build not found. Please run 'npm run build'.");
+      }
+    });
   } else {
     console.error("CRITICAL ERROR: 'dist' folder not found in production environment!");
     console.log("Current working directory:", process.cwd());
