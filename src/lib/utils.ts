@@ -12,8 +12,14 @@ export const setAuthToken = (token: string) => localStorage.setItem("token", tok
 export const removeAuthToken = () => localStorage.removeItem("token");
 
 export const getUser = () => {
-  const user = localStorage.getItem("user");
-  return user ? JSON.parse(user) : null;
+  try {
+    const user = localStorage.getItem("user");
+    return user ? JSON.parse(user) : null;
+  } catch (e) {
+    console.warn("Failed to parse user from localStorage:", e);
+    localStorage.removeItem("user");
+    return null;
+  }
 };
 export const setUser = (user: any) => localStorage.setItem("user", JSON.stringify(user));
 export const removeUser = () => localStorage.removeItem("user");
